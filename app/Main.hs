@@ -1,7 +1,7 @@
 {-# LANGUAGE OverloadedStrings, OverloadedRecordDot #-}
 
 import qualified Data.ByteString.Lazy.Char8 as L8
-import Data.Aeson (eitherDecode, FromJSON, parseJSON, withObject, (.:), (.:?), ToJSON, encode)
+import Data.Aeson (eitherDecode, FromJSON, parseJSON, withObject, (.:), (.:?), ToJSON, encode, object, (.=))
 import GHC.Generics (Generic)
 import qualified Data.ByteString.Lazy as B
 import System.Directory (doesFileExist, listDirectory)
@@ -26,6 +26,19 @@ data Track = Track
   , album :: String
   , duration :: Int
   } deriving (Show)
+
+data EnqueueFile = EnqueueFile
+  { filename :: Text
+  , size     :: Integer
+  } deriving (Show, Generic)
+
+instance ToJSON EnqueueFile
+
+newtype EnqueueRequest = EnqueueRequest
+  { files :: [EnqueueFile]
+  } deriving (Show, Generic)
+
+instance ToJSON EnqueueRequest
 
 data SearchResult = SearchResult
   { user :: String }
