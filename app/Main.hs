@@ -2,7 +2,6 @@
 
 import qualified Data.ByteString.Lazy.Char8 as L8
 import Data.Aeson (eitherDecode, FromJSON, parseJSON, withObject, (.:), (.:?), ToJSON, encode)
-import Data.Text (Text)
 import GHC.Generics (Generic)
 import qualified Data.ByteString.Lazy as B
 import System.Directory (doesFileExist, listDirectory)
@@ -54,9 +53,9 @@ instance FromJSON Track where
 main :: IO ()
 main = do
   response <- httpJSON
-                       $ setRequestMethod "GET"
-                       $ setRequestPath ( "https://api.spotify.com/v1/playlists/" <> playlistId <> "/tracks")
-                       $ defaultRequest
+              $ setRequestMethod "GET"
+              $ setRequestPath ( "https://api.spotify.com/v1/playlists/" <> playlistId <> "/tracks")
+              $ defaultRequest
   unless (getResponseStatusCode response == 200) $ error "getting playlist tracks failed"
   let trackList = getResponseBody response
 
