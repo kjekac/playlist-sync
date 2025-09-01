@@ -11,6 +11,7 @@ executable playlist-dl
       base >=4.14 && <5
     , aeson
     , http-conduit
+    , http-client
     , directory
     , filepath
     , process

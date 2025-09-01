@@ -1,20 +1,25 @@
 {-# LANGUAGE OverloadedStrings, OverloadedRecordDot #-}
 
-import Network.HTTP.Conduit (simpleHttp)
-import Data.Aeson (eitherDecode, FromJSON, parseJSON, withObject, (.:))
+import qualified Data.ByteString.Lazy.Char8 as L8
+import Data.Aeson (eitherDecode, FromJSON, parseJSON, withObject, (.:), (.:?), ToJSON, encode)
+import Data.Text (Text)
+import GHC.Generics (Generic)
 import qualified Data.ByteString.Lazy as B
 import System.Directory (doesFileExist, listDirectory)
 import qualified Sound.TagLib as TagLib
 import System.FilePath ((</>), takeExtension, splitExtension)
-import Data.List (isPrefixOf, isInfixOf, isSuffixOf)
+import Data.List
 import Data.Char (toLower)
 import Control.Concurrent.Async (race)
 import Data.Time.Clock (getCurrentTime, diffUTCTime, NominalDiffTime)
-import System.Process (callCommand)
+import System.Process (callCommand, readProcess)
+import Control.Monad
+import System.Exit (ExitCode(..))
 import Control.Concurrent (threadDelay)
 import Control.Exception (try, SomeException)
 import Data.Time.Clock (getCurrentTime, diffUTCTime)
 import Data.Maybe (isJust)
+import Network.HTTP.Simple
 
 data Track = Track
   { trackName :: String
@@ -22,6 +27,13 @@ data Track = Track
   , album :: String
   , duration :: Int
   } deriving (Show)
+
+data SearchResult = SearchResult
+  { user :: String }
+
+instance FromJSON SearchResult where
+  parseJSON = withObject "SearchResult" $ \v -> SearchResult
+    <$> v .: "user"
 
 instance Eq Track where
   track1 == track2 = and
@@ -41,10 +53,25 @@ instance FromJSON Track where
 
 main :: IO ()
 main = do
-  Right trackList <- eitherDecode <$> simpleHttp "https://api.spotify.com/v1/playlists/{playlist_id}/tracks"
+  response <- httpJSON
+                       $ setRequestMethod "GET"
+                       $ setRequestPath ( "https://api.spotify.com/v1/playlists/" <> playlistId <> "/tracks")
+                       $ defaultRequest
+  unless (getResponseStatusCode response == 200) $ error "getting playlist tracks failed"
+  let trackList = getResponseBody response
+
   existingTracks <- mapM extractTrackMetadata =<< listDirectory "path/to/folder"
   let remainingTracks = filter (flip notElem existingTracks) trackList
-  mapM_ downloadTrack remainingTracks
+  forM_ remainingTracks $ \track -> (prioritize <$> search track) >>= download >>= retag track
+
+prioritize :: Track -> [SearchResult] -> [SearchResult]
+prioritize track = sortBy isBetter . filter (isMatchOf track)
+
+isBetter :: SearchResult -> SearchResult -> Ordering
+isBetter = undefined
+
+isMatchOf :: Track -> SearchResult -> Bool
+isMatchOf = undefined
 
 extractTrackMetadata :: FilePath -> IO Track
 extractTrackMetadata file = do
@@ -62,23 +89,59 @@ extractTrackMetadata file = do
     , duration = duration
     }
 
-downloadTrack :: Track -> FilePath -> IO ()
-downloadTrack track = do
-  let searchCommand = "slskd search " ++ track.trackName ++ " " ++ track.artist
-  putStrLn $ "Searching for: " ++ track.trackName
-  result <- race (threadDelay 30000000) (callCommand searchCommand)
-  case result of
-    Left _ -> putStrLn $ "Download timed out for: " ++ track.trackName
-    Right _ -> do
-      putStrLn $ "Downloaded: " ++ track.trackName
-      rewriteTags track "path/to/downloaded/file" -- Replace with actual file path
+baseUrl = "http://localhost:5030/api/v0"
 
-rewriteTags :: Track -> FilePath -> IO ()
-rewriteTags track filePath = do
+search :: Track -> IO [SearchResult]
+search track = do
+  let searchID = show track
+  let searchRequest = object
+        [ "searchText" .= track.trackName
+        , "fileLimit" .= (10000 :: Int)
+        , "filterResponses" .= True
+        , "maximumPeerQueueLength" .= (1000000 :: Int)
+        , "minimumPeerUploadSpeed" .= (0 :: Int)
+        , "minimumResponseFileCount" .= (1 :: Int)
+        , "responseLimit" .= (100 :: Int)
+        , "searchTimeout" .= (15000 :: Int)
+        ]
+  response <- httpJSON
+              $ setRequestMethod "POST"
+              $ setRequestPath (baseUrl ++ "/searches")
+              $ setRequestBodyJSON searchRequest
+              $ defaultRequest
+  unless (getResponseStatusCode response == 200) $ error "search POST failed"
+  threadDelay 5000
+  searchResults <- httpJSON
+                   $ setRequestMethod "GET"
+                   $ setRequestPath (baseUrl ++ "/searches/" ++ searchID ++ "/responses")
+                   $ defaultRequest
+  unless (getResponseStatusCode response == 200) $ error "couldn't get search results"
+  pure $ getResponseBody searchResults
+
+
+-- Download the first result. If the download has not finished within 30s, try the next result until one succeeds.
+download :: [SearchResult] -> IO FilePath
+download results = do
+  let enqueueRequest = EnqueueRequest { files = map toEnqueueFile results }
+  response <- httpJSON
+              $ setRequestMethod "POST"
+              $ setRequestPath (baseUrl ++ "/transfers/downloads/" ++ head results.user)
+              $ setRequestBodyJSON enqueueRequest
+              $ defaultRequest
+  unless (getResponseStatusCode response == 200) $ error "download POST failed"
+  let EnqueueResponse { ok } = getResponseBody response
+  if ok
+    then return "Download enqueued successfully"
+    else error "Failed to enqueue download"
+  where
+    toEnqueueFile (SearchResult user) = EnqueueFile { filename = user, size = 0 } -- Adjust as needed
+
+retag :: Track -> FilePath -> IO ()
+retag track filePath = do
   Just tagFile <- TagLib.open filePath
   Just tag <- TagLib.tag tagFile
   TagLib.setTitle tag track.trackName
   TagLib.setArtist tag track.artist
   TagLib.setAlbum tag track.album
   TagLib.save tagFile
-  putStrLn $ "Tags rewritten for: " ++ track.trackName
+  putStrLn $ "Tags rewritten for: " ++ filePath
