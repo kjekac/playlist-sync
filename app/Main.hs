@@ -62,7 +62,7 @@ extractTrackMetadata file = do
     , duration = duration
     }
 
-downloadTrack :: Track -> IO ()
+downloadTrack :: Track -> FilePath -> IO ()
 downloadTrack track = do
   let searchCommand = "slskd search " ++ track.trackName ++ " " ++ track.artist
   putStrLn $ "Searching for: " ++ track.trackName
@@ -71,9 +71,14 @@ downloadTrack track = do
     Left _ -> putStrLn $ "Download timed out for: " ++ track.trackName
     Right _ -> do
       putStrLn $ "Downloaded: " ++ track.trackName
-      rewriteTags track
+      rewriteTags track "path/to/downloaded/file" -- Replace with actual file path
 
-rewriteTags :: Track -> IO ()
-rewriteTags track = do
-  -- Implement logic to rewrite tags
+rewriteTags :: Track -> FilePath -> IO ()
+rewriteTags track filePath = do
+  Just tagFile <- TagLib.open filePath
+  Just tag <- TagLib.tag tagFile
+  TagLib.setTitle tag track.trackName
+  TagLib.setArtist tag track.artist
+  TagLib.setAlbum tag track.album
+  TagLib.save tagFile
   putStrLn $ "Tags rewritten for: " ++ track.trackName
