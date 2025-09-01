@@ -41,18 +41,10 @@ instance FromJSON Track where
 
 main :: IO ()
 main = do
-  -- Fetch and parse playlist JSON
-  playlistJson <- simpleHttp "https://api.spotify.com/v1/playlists/{playlist_id}/tracks"
-  let tracks = eitherDecode playlistJson :: Either String [Track]
-  case tracks of
-    Left err -> putStrLn $ "Error parsing JSON: " ++ err
-    Right trackList -> do
-      -- Extract metadata from existing files
-      files <- listDirectory "path/to/folder"
-      existingTracks <- mapM extractTrackMetadata files
-      let remainingTracks = filter (flip notElem existingTracks) trackList
-      mapM_ downloadTrack remainingTracks
-
+  Right trackList <- eitherDecode <$> simpleHttp "https://api.spotify.com/v1/playlists/{playlist_id}/tracks"
+  existingTracks <- mapM extractTrackMetadata =<< listDirectory "path/to/folder"
+  let remainingTracks = filter (flip notElem existingTracks) trackList
+  mapM_ downloadTrack remainingTracks
 
 extractTrackMetadata :: FilePath -> IO Track
 extractTrackMetadata file = do
@@ -63,7 +55,7 @@ extractTrackMetadata file = do
   album <- TagLib.album tag
   Just audioProps <- TagLib.audioProperties tagFile
   duration <- fromIntegral <$> TagLib.duration audioProps
-  return Track
+  pure Track
     { trackName = title
     , artist = artist
     , album = album
