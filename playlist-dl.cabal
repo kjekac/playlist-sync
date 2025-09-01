@@ -16,4 +16,6 @@ executable playlist-dl
     , process
     , time
     , taglib
+    , bytestring
+    , async
 

@@ -1,10 +1,15 @@
-{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE OverloadedStrings, OverloadedRecordDot #-}
 
 import Network.HTTP.Conduit (simpleHttp)
 import Data.Aeson (eitherDecode, FromJSON, parseJSON, withObject, (.:))
 import qualified Data.ByteString.Lazy as B
 import System.Directory (doesFileExist, listDirectory)
-import System.FilePath ((</>), takeExtension)
+import qualified Sound.TagLib as TagLib
+import System.FilePath ((</>), takeExtension, splitExtension)
+import Data.List (isPrefixOf, isInfixOf, isSuffixOf)
+import Data.Char (toLower)
+import Control.Concurrent.Async (race)
+import Data.Time.Clock (getCurrentTime, diffUTCTime, NominalDiffTime)
 import System.Process (callCommand)
 import Control.Concurrent (threadDelay)
 import Control.Exception (try, SomeException)
@@ -15,8 +20,17 @@ data Track = Track
   { trackName :: String
   , artist :: String
   , album :: String
-  , length :: Int
+  , duration :: Int
   } deriving (Show)
+
+instance Eq Track where
+  track1 == track2 = and
+    [ map toLower track1.trackName == map toLower track2.trackName
+    , map toLower track1.artist == map toLower track2.artist
+    , map toLower track1.album `isPrefixOf` map toLower track2.album
+    || map toLower track2.album `isPrefixOf` map toLower track1.album
+    , abs (track1.duration - track2.duration) <= 5
+    ]
 
 instance FromJSON Track where
   parseJSON = withObject "Track" $ \v -> Track
@@ -33,24 +47,41 @@ main = do
   case tracks of
     Left err -> putStrLn $ "Error parsing JSON: " ++ err
     Right trackList -> do
-      -- Check existing files
+      -- Extract metadata from existing files
       files <- listDirectory "path/to/folder"
-      let remainingTracks = filter (not . isTrackDownloaded files) trackList
+      existingTracks <- mapM extractTrackMetadata files
+      let remainingTracks = filter (flip notElem existingTracks) trackList
       mapM_ downloadTrack remainingTracks
 
-isTrackDownloaded :: [FilePath] -> Track -> Bool
-isTrackDownloaded files track = any (matchesTrack track) files
 
-matchesTrack :: Track -> FilePath -> Bool
-matchesTrack track file = 
-  let (name, ext) = splitExtension file
-  in trackName track `isInfixOf` name && artist track `isInfixOf` name
+extractTrackMetadata :: FilePath -> IO Track
+extractTrackMetadata file = do
+  Just tagFile <- TagLib.open file
+  Just tag <- TagLib.tag tagFile
+  title <- TagLib.title tag
+  artist <- TagLib.artist tag
+  album <- TagLib.album tag
+  Just audioProps <- TagLib.audioProperties tagFile
+  duration <- fromIntegral <$> TagLib.duration audioProps
+  return Track
+    { trackName = title
+    , artist = artist
+    , album = album
+    , duration = duration
+    }
 
 downloadTrack :: Track -> IO ()
 downloadTrack track = do
-  let searchCommand = "slskd search " ++ trackName track ++ " " ++ artist track
-  putStrLn $ "Searching for: " ++ trackName track
-  callCommand searchCommand
-  -- Simulate download and tag rewriting
-  threadDelay 30000000 -- 30 seconds
-  putStrLn $ "Downloaded and tagged: " ++ trackName track
+  let searchCommand = "slskd search " ++ track.trackName ++ " " ++ track.artist
+  putStrLn $ "Searching for: " ++ track.trackName
+  result <- race (threadDelay 30000000) (callCommand searchCommand)
+  case result of
+    Left _ -> putStrLn $ "Download timed out for: " ++ track.trackName
+    Right _ -> do
+      putStrLn $ "Downloaded: " ++ track.trackName
+      rewriteTags track
+
+rewriteTags :: Track -> IO ()
+rewriteTags track = do
+  -- Implement logic to rewrite tags
+  putStrLn $ "Tags rewritten for: " ++ track.trackName
