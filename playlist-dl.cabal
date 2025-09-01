@@ -1,0 +1,19 @@
+cabal-version: 2.4
+name: playlist-dl
+version: 0.1.0.0
+build-type: Simple
+
+executable playlist-dl
+  hs-source-dirs: app
+  main-is: Main.hs
+  default-extensions: GHC2021
+  build-depends:
+      base >=4.14 && <5
+    , aeson
+    , http-conduit
+    , directory
+    , filepath
+    , process
+    , time
+    , taglib
+
