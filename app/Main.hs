@@ -21,14 +21,16 @@ import Data.Bifunctor
 import Data.Function         (on)
 import Data.Foldable         (find)
 import Data.Functor
-import Data.List             
+import Data.List
+import Data.String (IsString)
+import Data.Char (Char, generalCategory, isAlphaNum, isSpace, GeneralCategory(..))
 import Data.Maybe            
 import Data.Ord              (Down(..))
 import Data.Time.Clock       (UTCTime, getCurrentTime, addUTCTime)
-import Data.String
+import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Normalize as UN
-import Data.Char (generalCategory, GeneralCategory(..), isAlphaNum, isSpace, toLower)
+import Prelude hiding (Char)
 import qualified Data.UUID as UUID
 import qualified Data.UUID.V4 as UUIDv4
 import GHC.Generics          (Generic)
@@ -44,23 +46,21 @@ import System.IO.Unsafe
 
 -- === domain ===
 
-newtype Tag = Tag { getTag :: String }
+newtype Tag = Tag { getTag :: Text }
   deriving (IsString, ToJSON, Semigroup)
 instance Show Tag where show = (.getTag)
 instance Eq   Tag where (==) = on (==) (normalizeStr . (.getTag))
 
 -- normalizeStr :: (IsString a, Show a) => a -> a
 normalizeStr
-    = T.unpack
-    . T.toLower
+    = T.toLower
     . squashSpaces
     . T.map mapChar
     . stripMarks
     . UN.normalize UN.NFKD
-    . T.pack
   where
     -- remove combining marks after NFKD (diacritics, etc.)
-    stripMarks :: T.Text -> T.Text
+    stripMarks :: Text -> Text
     stripMarks = T.filter (\c -> generalCategory c /= NonSpacingMark)
 
     -- unify categories: dashes -> '-', other punct/symbols -> ' ', keep alnum, keep spaces
@@ -80,25 +80,25 @@ normalizeStr
           | isSpace c       -> ' '
           | otherwise       -> ' '
 
-    squashSpaces :: T.Text -> T.Text
+    squashSpaces :: Text -> Text
     squashSpaces = T.unwords . T.words
 
-badWords :: [String]
+badWords :: [Text]
 badWords =
   [ "remaster","remastered","anniversary","deluxe","expanded","bonus","reissue","edition"
   , "mono","stereo","mix","remix","version","edit","radio edit","single edit","live"
   , "demo","instrumental","re-recorded","rerecorded","reimagined","remake","feat","featuring"
   ]
 
-lowers :: String -> String
-lowers = map toLower
+lowers :: Text -> Text
+lowers = T.toLower
 
-hasBad :: String -> Bool
-hasBad s = let ls = lowers s in any (`isInfixOf` ls) badWords
+hasBad :: Text -> Bool
+hasBad s = let ls = lowers s in any (`T.isInfixOf` ls) badWords
 
 -- drop bracketed segments that contain bad words: (...) and [...]
-dropBadBrackets :: String -> String
-dropBadBrackets = dropAll '[' ']' . dropAll '(' ')'
+dropBadBrackets :: Text -> Text
+dropBadBrackets = T.pack . dropAll '[' ']' . dropAll '(' ')' . T.unpack
   where
     dropAll :: Char -> Char -> String -> String
     dropAll l r = go
@@ -115,53 +115,21 @@ dropBadBrackets = dropAll '[' ']' . dropAll '(' ')'
                                else pre <> [l] <> mid <> [if null rest' then '\0' else r] <> go tail'
 
 -- if there’s a trailing " - blah" and blah has bad words, drop it
-dropBadDashSuffix :: String -> String
+dropBadDashSuffix :: Text -> Text
 dropBadDashSuffix s =
-  case breakOnLast " - " s of
-    Nothing          -> s
-    Just (a, b)      -> if hasBad b then a else s
-  where
-    breakOnLast :: String -> String -> Maybe (String, String)
-    breakOnLast needle hay =
-      let (pre, suf) = lastSplit needle hay
-      in if null suf then Nothing else Just (pre, suf)
-    lastSplit :: String -> String -> (String, String)
-    lastSplit n xs =
-      let go acc "" = acc
-          go (p,q) ys =
-            case stripSuffix n ys of
-              Just pfx -> (pfx, drop (length n) ys)
-              Nothing  -> go (init p, last p : q) (init ys)
-      in go (xs, "") xs
-    stripSuffix suf str =
-      if suf `isSuffixOf` str then Just (take (length str - length suf) str) else Nothing
-    isSuffixOf suf str = reverse suf `isPrefixOf` reverse str
-    isPrefixOf pre str = take (length pre) str == pre
+  case T.breakOnEnd " - " s of
+    ("", _) -> s
+    (a, b)  -> if hasBad b then a else s
 
 -- also kill inline " / " qualifiers like "Dark Train / Remastered 2014"
-dropBadSlashParts :: String -> String
+dropBadSlashParts :: Text -> Text
 dropBadSlashParts =
-  unwords . filter (not . hasBad) . splitOnSlash
-  where
-    splitOnSlash "" = []
-    splitOnSlash xs =
-      let (a,b) = breakOn " / " xs
-      in a : case b of
-               ""     -> []
-               (_:_:_:rest) -> splitOnSlash rest
-    breakOn n s =
-      case findIndexSub n s of
-        Nothing -> (s,"")
-        Just i  -> (take i s, drop i s)
-    findIndexSub sub s = findIndex (isPrefixOf sub) (tails s)
-    isPrefixOf pre str = take (length pre) str == pre
-    tails [] = [[]]
-    tails ys@(_:zs) = ys : tails zs
+  T.unwords . filter (not . hasBad) . T.splitOn " / "
 
-cleanQualifiers :: String -> String
+cleanQualifiers :: Text -> Text
 cleanQualifiers = dropBadDashSuffix . dropBadSlashParts . dropBadBrackets
 
-cleanTag :: String -> Tag
+cleanTag :: Text -> Tag
 cleanTag = Tag . cleanQualifiers
 
 newtype Duration = Duration Integer
@@ -177,17 +145,17 @@ data Track = Track
   } deriving Eq
 
 instance Show Track where
-  show Track{..} = concat [ show artist, " - ", show trackName
-                          , " (", show album, ", ", show duration, ")"]
+  show Track{..} = T.unpack $ T.concat [ show artist, " - ", show trackName
+                                       , " (", show album, ", ", show duration, ")"]
 
 instance FromJSON Track where
   parseJSON = withObject "spotify.track" $ \v -> do
-    trackName  <- cleanTag <$> v .: "name"
-    artist     <- Tag <$> do
+    trackName  <- cleanTag . T.pack <$> v .: "name"
+    artist     <- Tag . T.pack <$> do
       arr <- v .: "artists" :: Parser [Value]
       artists <- mapM (withObject "artist" (\ao -> ao .: "name")) arr
-      pure $ intercalate ", " artists
-    album     <- fmap cleanTag . withObject "album" (\ao -> ao .: "name") =<< (v .: "album")
+      pure $ T.intercalate ", " artists
+    album     <- fmap (cleanTag . T.pack) . withObject "album" (\ao -> ao .: "name") =<< (v .: "album")
     duration <- Duration . (`div` 1000) <$> v .: "duration_ms"
     pure Track{..}
 
@@ -351,7 +319,7 @@ estimateKbps bytes (Duration durSec) =
 
 formatRank :: Track -> FileRef -> Int
 formatRank t f =
-  let ext = dropWhile (=='.') . map toLower $ takeExtension f.filename
+  let ext = T.dropWhile (=='.') . T.toLower . T.pack $ takeExtension f.filename
       attr = f.attributes
       is320cbr = maybe False (\a -> a.aVbr == Just False && maybe False (>=320) a.aBitrate) attr
       isV0     = maybe False (\a -> a.aVbr == Just True  && maybe False (>=230) a.aBitrate) attr
@@ -380,7 +348,7 @@ search t = do
     sid <- UUID.toString <$> UUIDv4.nextRandom
     let sidPath    = urlEncode sid
         searchUrl  = baseUrl <> "/searches"
-        searchText = t.artist <> " - " <> t.trackName
+        searchText = t.artist.getTag <> " - " <> t.trackName.getTag
     postJSON_ searchUrl $ object
       [ "id"                         .= sid
       , "searchText"                 .= searchText
