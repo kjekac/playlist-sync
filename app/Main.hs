@@ -5,6 +5,8 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE BlockArguments #-}
+{-# LANGUAGE PatternSynonyms #-}
+{-# LANGUAGE ViewPatterns #-}
 
 module Main where
 
@@ -21,6 +23,7 @@ import Data.Bifunctor
 import Data.Function         (on)
 import Data.Foldable         (find)
 import Data.Functor
+import Data.Functor.Identity
 import Data.List
 import Data.String (IsString)
 import Data.Char (Char, generalCategory, isAlphaNum, isSpace, GeneralCategory(..))
@@ -38,21 +41,57 @@ import Network.HTTP.Simple
 import Network.HTTP.Base     (urlEncode)
 import System.Environment    (getEnv)
 import System.FilePath       (takeFileName, takeExtension, (</>))
+import qualified System.FilePath.Windows as W
 import System.Directory.Tree qualified as DirTree
 import System.IO             (hPutStrLn, stderr)
 import Sound.TagLib          qualified as TagLib
 
 import System.IO.Unsafe
 
+-- | Bidirectional pattern synonym for 'empty' and 'null' (both /O(1)/),
+-- to be used together with '(:<)' or '(:>)'.
+--
+-- Exists in text 2.1.2 but we don't have access to that here.
+-- TODO move to a compatibility module with #if MIN_VERSION_text(2,1,2)
+pattern Empty :: Text
+pattern Empty <- (T.null -> True) where
+  Empty = T.empty
+
+-- | Bidirectional pattern synonym for 'cons' (/O(n)/) and 'uncons' (/O(1)/),
+-- to be used together with 'Empty'.
+--
+-- Exists in text 2.1.2 but we don't have access to that here.
+-- TODO move to a compatibility module with #if MIN_VERSION_text(2,1,2)
+pattern (:<) :: Char -> Text -> Text
+pattern x :< xs <- (T.uncons -> Just (x, xs)) where
+  (:<) = T.cons
+infixr 5 :<
+{-# COMPLETE Empty, (:<) #-}
+
+-- | Bidirectional pattern synonym for 'snoc' (/O(n)/) and 'unsnoc' (/O(1)/)
+-- to be used together with 'Empty'.
+--
+-- Exists in text 2.1.2 but we don't have access to that here.
+-- TODO move to a compatibility module with #if MIN_VERSION_text(2,1,2)
+pattern (:>) :: Text -> Char -> Text
+pattern xs :> x <- (T.unsnoc -> Just (xs, x)) where
+  (:>) = T.snoc
+infixl 5 :>
+{-# COMPLETE Empty, (:>) #-}
+
+-- For some reason Data.Text has the monadic version but not the pure version??
+spanEnd :: (Char -> Bool) -> Text -> (Text, Text)
+spanEnd f = runIdentity . T.spanEndM (pure . f)
+
 -- === domain ===
 
 newtype Tag = Tag { getTag :: Text }
   deriving (IsString, ToJSON, Semigroup)
-instance Show Tag where show = (.getTag)
-instance Eq   Tag where (==) = on (==) (normalizeStr . (.getTag))
+instance Show Tag where show = show . (.getTag)
+instance Eq   Tag where (==) = on (==) (normalizeText . (.getTag))
 
--- normalizeStr :: (IsString a, Show a) => a -> a
-normalizeStr
+normalizeText :: Text -> Text
+normalizeText
     = T.toLower
     . squashSpaces
     . T.map mapChar
@@ -67,7 +106,7 @@ normalizeStr
     mapChar :: Char -> Char
     mapChar c =
       case generalCategory c of
-        DashPunctuation     -> '-'          -- all the weird hyphens
+        DashPunctuation     -> ' '          -- all the weird hyphens
         ConnectorPunctuation-> ' '
         OtherPunctuation    -> ' '
         InitialQuote        -> ' '
@@ -86,48 +125,37 @@ normalizeStr
 badWords :: [Text]
 badWords =
   [ "remaster","remastered","anniversary","deluxe","expanded","bonus","reissue","edition"
-  , "mono","stereo","mix","remix","version","edit","radio edit","single edit","live"
-  , "demo","instrumental","re-recorded","rerecorded","reimagined","remake","feat","featuring"
+  , "mono","stereo","instrumental","re-recorded","rerecorded","feat","featuring"
   ]
 
-lowers :: Text -> Text
-lowers = T.toLower
-
-hasBad :: Text -> Bool
-hasBad s = let ls = lowers s in any (`T.isInfixOf` ls) badWords
+hasJunk :: Text -> Bool
+hasJunk s = any (`T.isInfixOf` T.toLower s) badWords
 
 -- drop bracketed segments that contain bad words: (...) and [...]
-dropBadBrackets :: Text -> Text
-dropBadBrackets = T.pack . dropAll '[' ']' . dropAll '(' ')' . T.unpack
+dropJunkBrackets :: Text -> Text
+dropJunkBrackets = dropAll '[' ']' . dropAll '(' ')'
   where
-    dropAll :: Char -> Char -> String -> String
+    dropAll :: Char -> Char -> Text -> Text
     dropAll l r = go
       where
-        go xs =
-          case break (== l) xs of
-            (pre, [])   -> pre
-            (pre, _ : rest) ->
-              let (mid, rest') = break (== r) rest
-                  tail' = case rest' of
-                            []      -> []           -- no closing; keep what’s left
-                            (_:rs)  -> rs
-              in if hasBad mid then pre <> go tail'     -- drop the bracketed junk
-                               else pre <> [l] <> mid <> [if null rest' then '\0' else r] <> go tail'
+        go xs = case T.break (==l) xs of
+          (_, Empty)     -> xs
+          (pre, _:<rest) -> case T.break (==r) rest of
+            (_, Empty)     -> xs
+            (mid, _:<post) ->
+              if hasJunk mid
+                then pre <> go post
+                else T.concat [pre, T.singleton l, mid, T.singleton r, go post]
 
 -- if there’s a trailing " - blah" and blah has bad words, drop it
-dropBadDashSuffix :: Text -> Text
-dropBadDashSuffix s =
-  case T.breakOnEnd " - " s of
-    ("", _) -> s
-    (a, b)  -> if hasBad b then a else s
-
--- also kill inline " / " qualifiers like "Dark Train / Remastered 2014"
-dropBadSlashParts :: Text -> Text
-dropBadSlashParts =
-  T.unwords . filter (not . hasBad) . T.splitOn " / "
+dropJunkSuffix :: Text -> Text
+dropJunkSuffix s =
+  case spanEnd (\c -> DashPunctuation /= (generalCategory c) && c /= '/') s of
+    (Empty, _) -> s
+    (a:>_, b)     -> if hasJunk b then dropJunkSuffix a else s
 
 cleanQualifiers :: Text -> Text
-cleanQualifiers = dropBadDashSuffix . dropBadSlashParts . dropBadBrackets
+cleanQualifiers = T.strip . dropJunkSuffix . dropJunkBrackets
 
 cleanTag :: Text -> Tag
 cleanTag = Tag . cleanQualifiers
@@ -145,17 +173,17 @@ data Track = Track
   } deriving Eq
 
 instance Show Track where
-  show Track{..} = T.unpack $ T.concat [ show artist, " - ", show trackName
-                                       , " (", show album, ", ", show duration, ")"]
+  show Track{..} = T.unpack $ T.concat [ artist.getTag, " - ", trackName.getTag
+                                       , " (", album.getTag, ", ", T.pack (show duration), ")"]
 
 instance FromJSON Track where
   parseJSON = withObject "spotify.track" $ \v -> do
-    trackName  <- cleanTag . T.pack <$> v .: "name"
-    artist     <- Tag . T.pack <$> do
+    trackName  <- cleanTag <$> v .: "name"
+    artist     <- Tag <$> do
       arr <- v .: "artists" :: Parser [Value]
       artists <- mapM (withObject "artist" (\ao -> ao .: "name")) arr
       pure $ T.intercalate ", " artists
-    album     <- fmap (cleanTag . T.pack) . withObject "album" (\ao -> ao .: "name") =<< (v .: "album")
+    album     <- fmap cleanTag . withObject "album" (\ao -> ao .: "name") =<< (v .: "album")
     duration <- Duration . (`div` 1000) <$> v .: "duration_ms"
     pure Track{..}
 
@@ -171,7 +199,7 @@ extractSpotifyTracks =
 -- search results (peer responses)
 
 data FileRef = FileRef
-  { filename :: String
+  { filename :: FilePath
   , size     :: Integer
   , attributes :: Maybe Attributes
   } deriving (Show)
@@ -301,15 +329,17 @@ postJSON_ url body = do
 
 -- === matching + ranking ===
 
+trk a = trkWith "" a
+trkId a = trk a a
+trkWith l a b = unsafePerformIO (putStrLn (l <> show a) $> b)
+trkWithId l a = trkWith l a a
+
 isMatchOf :: Track -> Source -> Bool
 isMatchOf t src =
-       on isInfixOf normalizeStr t.artist.getTag    path
-    && on isInfixOf normalizeStr t.album.getTag     path
-    && on isInfixOf normalizeStr t.trackName.getTag file
+       on T.isInfixOf normalizeText t.artist.getTag    (T.pack src.file.filename)
+    && on T.isInfixOf normalizeText t.album.getTag     (T.pack $ W.takeDirectory src.file.filename)
+    && on T.isInfixOf normalizeText t.trackName.getTag (T.pack $ W.takeFileName src.file.filename)
     && and (src.file.attributes >>= (.aDuration) <&> (== t.duration))
-  where
-    (file,path) = let isSep c = c == '\\' || c == '/'
-                  in bimap reverse reverse . span (not . isSep) . reverse $ src.file.filename
 
 
 estimateKbps :: Integer -> Duration -> Int
@@ -349,6 +379,7 @@ search t = do
     let sidPath    = urlEncode sid
         searchUrl  = baseUrl <> "/searches"
         searchText = t.artist.getTag <> " - " <> t.trackName.getTag
+    putStrLn $ "searching for " <> show t
     postJSON_ searchUrl $ object
       [ "id"                         .= sid
       , "searchText"                 .= searchText
@@ -361,8 +392,9 @@ search t = do
       , "responseLimit"              .= (100 :: Int)
       , "searchTimeout"              .= (15000 :: Int)
       ]
-    putStrLn $ "searching for " <> show t
     results <- pollJSON (searchUrl <> "/" <> sidPath <> "/responses") 6 10000000
+    putStrLn $ "results: " <> show results
+    putStrLn $ "filtered: " <> show (filter (isMatchOf t) . join $ expand <$> results)
     pure . filter (isMatchOf t) . join $ expand <$> results
   where
     -- simple poller: try n times, sleep d µs between, return first successful parse
@@ -415,7 +447,10 @@ downloadOne seconds src = do
       concat <$> forM dirs (withObject "dir" $ \d -> d .:? "files" .!= [])
 
     inferPath :: Download -> FilePath
-    inferPath d = fromMaybe (downloadsDir </> takeFileName d.filename) d.destination
+    inferPath d = trk ("infer from: " <> show d) $
+                  let folder = W.takeFileName . W.takeDirectory $ d.filename
+                      file   = W.takeFileName d.filename
+                  in fromMaybe (downloadsDir </> folder </> file) d.destination
 
     relevant :: Download -> Bool
     relevant d = d.filename == src.file.filename && d.size == src.file.size
@@ -425,27 +460,46 @@ getTrack DirTree.File{file} = Just <$> do
   Just tagFile <- TagLib.open file
   Just tag     <- TagLib.tag tagFile
   Just props   <- TagLib.audioProperties tagFile
-  trackName    <- Tag <$> TagLib.title tag
-  artist       <- Tag <$> TagLib.artist tag
-  album        <- Tag <$> TagLib.album tag
+  trackName    <- Tag . T.pack <$> TagLib.title tag
+  artist       <- Tag . T.pack <$> TagLib.artist tag
+  album        <- Tag . T.pack <$> TagLib.album tag
   duration     <- Duration <$> TagLib.duration props
   pure Track{..}
 getTrack _ = pure Nothing
 
 retag :: Track -> FilePath -> IO ()
 retag track filePath = do
-  Just tagFile <- TagLib.open filePath
-  Just tag <- TagLib.tag tagFile
-  TagLib.setTitle tag $ track.trackName.getTag
-  TagLib.setArtist tag $ track.artist.getTag
-  TagLib.setAlbum tag $ track.album.getTag
-  void $ TagLib.save tagFile
-  putStrLn $ "Tags rewritten for: " ++ filePath
+  putStrLn $ "retagging: " <> filePath
+  mTagFile <- TagLib.open filePath
+  case mTagFile of
+    Nothing -> putStrLn "no tagfile"
+    Just tagFile -> do
+      putStrLn $ "tagFile: " <> show tagFile
+      mTag <- TagLib.tag tagFile
+      case mTag of
+        Nothing -> putStrLn "no tag"
+        Just tag -> do
+          TagLib.setTitle tag . show $ track.trackName.getTag
+          TagLib.setArtist tag . show $ track.artist.getTag
+          TagLib.setAlbum tag . show $ track.album.getTag
+          void $ TagLib.save tagFile
+          putStrLn $ "Tags rewritten for: " ++ filePath
+
+getSpotifyBearer :: BS.ByteString -> IO BS.ByteString
+getSpotifyBearer basic = do
+  let req = setRequestMethod "POST"
+          $ setRequestBodyURLEncoded [("grant_type","client_credentials")]
+          $ addRequestHeader "Authorization" ("Basic " <> basic)
+          $ addRequestHeader "Accept" "application/json"
+          $ parseRequest_ "https://accounts.spotify.com/api/token"
+  Just tok <- parseMaybe (withObject "tok" (.: "access_token")) . getResponseBody <$> httpJSON req
+  pure $ BS.pack tok
 
 main :: IO ()
 main = do
   let playlistId   = "6cEYRePGLzuxJ6WGL2TgAI"
-  let spotifyToken = "BQBOiyEdcmCq12hPRpisASHwUo2HuVCJiuGZX3AQ9VFLCk5SbMFAjbMXHTrBItu3v8jbfWGK67BeOi9XU_Vto-KFkGrnwGeSf3_uTsYCh80e9ZQs40R2qqBkKTiVL8N8uLOgkvzoE3o"
+  let spotifySecret = "ZWNlNWVmM2YwNGYxNGM4ZWE1MWZhMDliN2NkMTg3NzA6YjlkMDQ2NDUwYmU0NDJmY2JlNzk1NDE1NmJhNDQ1MjI="
+  spotifyToken <- getSpotifyBearer spotifySecret
   response <- httpJSON
               $ addRequestHeader "authorization" ("Bearer " <> spotifyToken)
               $ setRequestMethod "GET"
@@ -458,4 +512,4 @@ main = do
   putStrLn $ "existing tracks: " <> show (length existingTracks)
   let missing = filter (`notElem` existingTracks) (extractSpotifyTracks $ getResponseBody response)
   putStrLn $ "missing tracks: " <> show (length missing)
-  forM_ missing $ \track -> (prioritize track <$> search track) >>= download >>= traverse (retag track)
+  forM_ missing $ \track -> search track >>= download . prioritize track >>= traverse (retag track)
