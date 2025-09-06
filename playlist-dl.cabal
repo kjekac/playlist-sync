@@ -24,3 +24,9 @@ executable playlist-dl
     , text
     , unicode-transforms
     , transformers
+    , network-uri
+    , base64-bytestring
+    , optparse-generic
+    , yaml
+    , unix
+    , temporary

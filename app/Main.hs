@@ -7,10 +7,12 @@
 {-# LANGUAGE BlockArguments #-}
 {-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE ViewPatterns #-}
+{-# LANGUAGE DeriveGeneric #-}
 
 module Main where
 
 import Control.Applicative
+import Control.Arrow
 import Control.Concurrent    (threadDelay)
 import Control.Exception
 import Control.Monad   --      (unless, when, forM_, void, join)
@@ -19,9 +21,10 @@ import Data.Aeson --            (FromJSON(..), ToJSON(..), (.:), (.=), (.:?), wi
 import Data.Aeson.Types      (Parser, defaultOptions, parseMaybe, parseEither)
 import Data.Aeson.Key        qualified as Key
 import Data.ByteString.Char8 qualified as BS
+import Data.ByteString.Base64 qualified as B64
 import Data.Bifunctor
 import Data.Function         (on)
-import Data.Foldable         (find)
+import Data.Foldable         (for_,find)
 import Data.Functor
 import Data.Functor.Identity
 import Data.List
@@ -36,14 +39,20 @@ import qualified Data.Text.Normalize as UN
 import Prelude hiding (Char)
 import qualified Data.UUID as UUID
 import qualified Data.UUID.V4 as UUIDv4
+import qualified Data.Yaml as Yaml
 import GHC.Generics          (Generic)
+import Options.Generic
 import Network.HTTP.Simple
 import Network.HTTP.Base     (urlEncode)
-import System.Environment    (getEnv)
+import Network.URI           (parseURI, uriPath)
+import System.Environment    (lookupEnv, getArgs, setEnv)
 import System.FilePath       (takeFileName, takeExtension, (</>))
 import qualified System.FilePath.Windows as W
 import System.Directory.Tree qualified as DirTree
 import System.IO             (hPutStrLn, stderr)
+import System.IO.Temp (withSystemTempDirectory)
+import System.Posix.Files (setFileMode)
+import System.Process
 import Sound.TagLib          qualified as TagLib
 
 import System.IO.Unsafe
@@ -79,9 +88,6 @@ pattern xs :> x <- (T.unsnoc -> Just (xs, x)) where
 infixl 5 :>
 {-# COMPLETE Empty, (:>) #-}
 
--- For some reason Data.Text has the monadic version but not the pure version??
-spanEnd :: (Char -> Bool) -> Text -> (Text, Text)
-spanEnd f = runIdentity . T.spanEndM (pure . f)
 
 -- === domain ===
 
@@ -124,7 +130,7 @@ normalizeText
 
 badWords :: [Text]
 badWords =
-  [ "remaster","remastered","anniversary","deluxe","expanded","bonus","reissue","edition"
+  [ "remaster","remastered","anniversary","deluxe","expanded","bonus","reissue","edition","original"
   , "mono","stereo","instrumental","re-recorded","rerecorded","feat","featuring"
   ]
 
@@ -153,6 +159,10 @@ dropJunkSuffix s =
   case spanEnd (\c -> DashPunctuation /= (generalCategory c) && c /= '/') s of
     (Empty, _) -> s
     (a:>_, b)     -> if hasJunk b then dropJunkSuffix a else s
+
+-- For some reason Data.Text has the monadic version but not the pure version??
+spanEnd :: (Char -> Bool) -> Text -> (Text, Text)
+spanEnd f = runIdentity . T.spanEndM (pure . f)
 
 cleanQualifiers :: Text -> Text
 cleanQualifiers = T.strip . dropJunkSuffix . dropJunkBrackets
@@ -293,15 +303,33 @@ instance FromJSON Download where
     <*> o .:? "queuePosition"
     <*> o .:? "speed"
 
+cancelDownload :: Download -> IO ()
+cancelDownload dl = do
+  let urlDelete = apiV0 <> "/transfers/downloads/" <> dl.id
+      urlPost   = urlDelete <> "/cancel"
+  eres <- try . httpNoBody <=< authed . setRequestMethod "DELETE" . parseRequest_ $ urlDelete
+  case eres of
+    Right _ -> putStrLn $ "Canceled (DELETE): " <> show dl
+    Left (_ :: SomeException) -> do
+      -- fallback: POST …/cancel
+      putStrLn $ "DELETE failed; trying POST cancel for " <> show dl
+      rsp <- httpNoBody <=< authed . setRequestMethod "POST" . parseRequest_ $ urlPost
+      let status = getResponseStatusCode rsp
+      if status >= 200 && status < 300
+        then putStrLn $ "Canceled (POST): " <> show dl
+        else putStrLn $ "Cancel failed, status " <> show status <> " for " <> show dl
+
 -- enqueue body
 newtype EnqueueRequest = EnqueueRequest { file :: FileRef }
 instance ToJSON EnqueueRequest where
   toJSON (EnqueueRequest f) = toJSON [object ["filename" .= f.filename, "size" .= f.size]]
 
 -- === config ===
+apiRoot :: String
+apiRoot = "http://localhost:5030"
 
-baseUrl :: String
-baseUrl = "http://localhost:5030/api/v0"
+apiV0 :: String
+apiV0  = apiRoot <> "/api/v0"
 
 -- directory where slskd writes; adjust to your slskd config
 downloadsDir :: FilePath
@@ -309,10 +337,9 @@ downloadsDir = "/home/kjekac/soulseek"
 -- === http helpers ===
 
 authed :: Request -> IO Request
-authed r = pure r
--- do
---   key <- getEnv "SLSKD_API_KEY"   -- export SLSKD_API_KEY=...
---   pure $ addRequestHeader "x-api-key" (BS.pack key) r
+authed req = do
+  Just key <- fmap BS.pack <$> lookupEnv "SLSKD_API_KEY"
+  pure $ addRequestHeader "X-Api-Key" key req
 
 getJSON :: FromJSON a => String -> IO a
 getJSON url = do
@@ -377,7 +404,7 @@ search :: Track -> IO [Source]
 search t = do
     sid <- UUID.toString <$> UUIDv4.nextRandom
     let sidPath    = urlEncode sid
-        searchUrl  = baseUrl <> "/searches"
+        searchUrl  = apiV0 <> "/searches"
         searchText = t.artist.getTag <> " - " <> t.trackName.getTag
     putStrLn $ "searching for " <> show t
     postJSON_ searchUrl $ object
@@ -401,7 +428,7 @@ search t = do
     pollJSON :: String -> Int -> Int -> IO [SearchResponse]
     pollJSON url tries delayUs = go tries
       where
-        go 0 = fail $ "search: no results for " <> show t
+        go 0 = [] <$ putStrLn ("search: no results for " <> show t)
         go n = threadDelay delayUs >> getJSON url >>= \case
           xs@(_:_) -> xs       <$ putStrLn ("got " <> show (length xs) <> " results for " <> show t)
           _        -> go (n-1) <* putStrLn ("no results, waiting: " <> show t)
@@ -410,8 +437,8 @@ search t = do
 download :: [Source] -> IO (Maybe FilePath)
 download []     = Nothing <$ putStrLn "failed to download"
 download (r:rs) = downloadOne 30 r >>= \case    -- seconds per candidate
-  Just p  -> putStrLn ("downloaded: " <> p)                    >> pure (Just p)
-  Nothing -> putStrLn "download timed out, trying next source" >> download rs
+  Just p  -> putStrLn ("Downloaded: " <> p)                    >> pure (Just p)
+  Nothing -> putStrLn "Download timed out, trying next source" >> download rs
 
 -- download :: [Source] -> IO (Maybe FilePath)
 -- download srcs = runMaybeT (asum (MaybeT . downloadOne 30 <$> srcs)) >>= \case
@@ -423,23 +450,32 @@ downloadOne :: Int -> Source -> IO (Maybe FilePath)
 downloadOne seconds src = do
     putStrLn $ "trying to download " <> show src
     postJSON_ downloadsUrl $ EnqueueRequest src.file
-    loop =<< addUTCTime (fromIntegral seconds) <$> getCurrentTime
+    loop =<< Just . addUTCTime (fromIntegral seconds) <$> getCurrentTime
   where
-    downloadsUrl = baseUrl <> "/transfers/downloads/" <> urlEncode src.username
+    downloadsUrl = apiV0 <> "/transfers/downloads/" <> urlEncode src.username
 
-    loop :: UTCTime -> IO (Maybe FilePath)
-    loop deadline = go
-      where
-        go = do
-          now <- getCurrentTime
-          if now > deadline then pure Nothing else do
-            v <- getJSON downloadsUrl
-            let ds = either (const []) id $ downloadsFromEnv v
-            case find relevant ds of
-              Just d@Download{status=(Just st)}
-                | "Complete" `isPrefixOf` st        -> putStrLn "Complete" >> (pure . Just $ inferPath d)
-              Just Download{status=(Just "Failed")} -> putStrLn "Failed" >> pure Nothing
-              _                                     -> putStrLn "Retry" >> threadDelay 300000 >> go
+    -- 'deadline' is active when we're NOT in progress. When we observe InProgress, we set it to Nothing.
+    loop :: Maybe UTCTime -> IO (Maybe FilePath)
+    loop mDeadline = do
+      now <- getCurrentTime
+      v   <- getJSON downloadsUrl
+      let ds = either (const []) id $ downloadsFromEnv v
+          timedOut = maybe False (now >) mDeadline
+
+      case find relevant ds of
+        Just d@Download{status = Just st, speed, bytesDone}
+          | "Complete"   `isPrefixOf` st -> putStrLn "Complete" $> Just (inferPath d)
+          | "Failed"     `isPrefixOf` st -> putStrLn "Failed"   $> Nothing
+          | "InProgress" `isInfixOf`  st -> do
+              putStrLn $ "Downloading: " <> show (speed, bytesDone)
+              threadDelay 300000
+              loop Nothing
+        dl | timedOut  -> Nothing <$ (putStrLn "Timed out" >> for_ dl cancelDownload)
+           | otherwise -> do
+              let newDeadline = mDeadline <|> Just (addUTCTime (fromIntegral seconds) now)
+              threadDelay 300000
+              loop newDeadline
+
 
     downloadsFromEnv :: Value -> Either String [Download]
     downloadsFromEnv = parseEither $ withObject "env" \o -> do
@@ -455,6 +491,7 @@ downloadOne seconds src = do
     relevant :: Download -> Bool
     relevant d = d.filename == src.file.filename && d.size == src.file.size
 
+-- TODO fix incomplete patterns
 getTrack :: DirTree.DirTree FilePath -> IO (Maybe Track)
 getTrack DirTree.File{file} = Just <$> do
   Just tagFile <- TagLib.open file
@@ -485,31 +522,98 @@ retag track filePath = do
           void $ TagLib.save tagFile
           putStrLn $ "Tags rewritten for: " ++ filePath
 
-getSpotifyBearer :: BS.ByteString -> IO BS.ByteString
-getSpotifyBearer basic = do
-  let req = setRequestMethod "POST"
-          $ setRequestBodyURLEncoded [("grant_type","client_credentials")]
-          $ addRequestHeader "Authorization" ("Basic " <> basic)
-          $ addRequestHeader "Accept" "application/json"
-          $ parseRequest_ "https://accounts.spotify.com/api/token"
-  Just tok <- parseMaybe (withObject "tok" (.: "access_token")) . getResponseBody <$> httpJSON req
-  pure $ BS.pack tok
+
+readPlaylist :: String -> String -> String -> IO [Track]
+readPlaylist playlistURL clientId clientSecret = do
+    let Just playlistId@(_:_) = takeFileName . uriPath <$> parseURI playlistURL
+
+    spotifyToken <- getSpotifyBearer
+    response <- httpJSON
+                $ addRequestHeader "authorization" ("Bearer " <> spotifyToken)
+                $ setRequestMethod "GET"
+                $ parseRequest_ ("https://api.spotify.com/v1/playlists/" <> playlistId <> "/tracks")
+    let status = getResponseStatusCode response
+    unless (status >= 200 && status < 300) $ error ("getting playlist tracks failed: " <> show response)
+
+    pure . extractSpotifyTracks . getResponseBody $ response
+  where
+    getSpotifyBearer :: IO BS.ByteString
+    getSpotifyBearer = do
+      let basic = B64.encode . BS.pack $ clientId <> ":" <> clientSecret
+          req = setRequestMethod "POST"
+              . setRequestBodyURLEncoded [("grant_type","client_credentials")]
+              . addRequestHeader "Authorization" ("Basic " <> basic)
+              . addRequestHeader "Accept" "application/json"
+              $ parseRequest_ "https://accounts.spotify.com/api/token"
+      Just tok <- parseMaybe (withObject "tok" (.: "access_token")) . getResponseBody <$> httpJSON req
+      pure $ BS.pack tok
+
+waitForHealth :: IO ()
+waitForHealth = do
+  let url = apiRoot <> "/health"
+  let go 0 = fail "slskd: healthcheck timed out"
+      go n = do
+        req <- parseRequest url
+        eres <- (Right <$> httpNoBody req) `catch` (\(_::SomeException) -> pure (Left ()))
+        case eres of
+          Right _ -> pure ()
+          Left _  -> threadDelay 300000 >> go (n-1)
+  go 2000   -- ~10m max
+
+genConfig :: String -> Yaml.Value
+genConfig key = object
+  [ "web" .= object
+      [ "authentication" .= object
+          [ "disabled" .= False
+          , "api_keys" .= object
+              [ "cli" .= object
+                  [ "key"  .= key
+                  , "role" .= ("readwrite" :: String)
+                  , "cidr" .= ("127.0.0.1/32,::1/128" :: String)
+                  ]
+              ]
+          ]
+      ]
+  ]
+
+withSlskd :: FilePath -> [FilePath] -> IO a -> IO a
+withSlskd downloadsDir shared action = do
+    secret <- UUID.toString <$> UUIDv4.nextRandom
+
+    withSystemTempDirectory "slskd-" $ \tmp -> do
+      let cfg  = tmp </> "slskd.yml"
+          args = concat
+            [ ["--config",cfg]
+            , ["--headless","--http-port","5030","--no-https"]
+            , ["--downloads", downloadsDir]
+            , if null shared then [] else "--shared":shared
+            , ["--slsk-username","piracyiscool","--slsk-password","kopimism"]
+            ]
+      Yaml.encodeFile cfg $ genConfig secret
+      setFileMode cfg 0o600
+      bracket
+        -- Nix flake puts slskd on PATH
+        (createProcess (proc "slskd" args))
+        (\(_,_,_,ph) -> terminateProcess ph >> void (waitForProcess ph))
+        (const $ waitForHealth >> setEnv "SLSKD_API_KEY" secret >> action)
+
+data Cmd = Cmd { playlist :: String, clientId :: String, clientSecret :: String
+               , downloads :: FilePath, shared :: [FilePath] }
+  deriving (Show, Generic)
+instance ParseRecord Cmd where parseRecord = parseRecordWithModifiers lispCaseModifiers
 
 main :: IO ()
 main = do
-  let playlistId   = "6cEYRePGLzuxJ6WGL2TgAI"
-  let spotifySecret = "ZWNlNWVmM2YwNGYxNGM4ZWE1MWZhMDliN2NkMTg3NzA6YjlkMDQ2NDUwYmU0NDJmY2JlNzk1NDE1NmJhNDQ1MjI="
-  spotifyToken <- getSpotifyBearer spotifySecret
-  response <- httpJSON
-              $ addRequestHeader "authorization" ("Bearer " <> spotifyToken)
-              $ setRequestMethod "GET"
-              $ parseRequest_ ("https://api.spotify.com/v1/playlists/" <> playlistId <> "/tracks")
-  putStrLn . show $ response
-  let status = getResponseStatusCode response
-  unless (status >= 200 && status < 300) $ error "getting playlist tracks failed"
+  Cmd{..} <- getRecord "playlist-pl"
 
-  existingTracks <- fmap catMaybes . mapM getTrack . DirTree.flattenDir . (.dirTree) =<< DirTree.build downloadsDir
-  putStrLn $ "existing tracks: " <> show (length existingTracks)
-  let missing = filter (`notElem` existingTracks) (extractSpotifyTracks $ getResponseBody response)
-  putStrLn $ "missing tracks: " <> show (length missing)
-  forM_ missing $ \track -> search track >>= download . prioritize track >>= traverse (retag track)
+  playlist <- readPlaylist playlist clientId clientSecret
+  putStrLn $ "need tracks: " <> show (length playlist)
+
+  existingTracks <- fmap catMaybes . mapM getTrack . DirTree.flattenDir . (.dirTree) =<< DirTree.build downloads
+  putStrLn $ "have tracks: " <> show (length existingTracks)
+
+  let missing = filter (`notElem` existingTracks) playlist
+  putStrLn $ "miss tracks: " <> show (length missing)
+
+  withSlskd downloads shared $ do
+    forM_ missing $ \track -> search track >>= download . prioritize track >>= traverse (retag track)
