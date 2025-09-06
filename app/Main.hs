@@ -12,50 +12,49 @@
 module Main where
 
 import Control.Applicative
-import Control.Arrow
+
 import Control.Concurrent    (threadDelay)
 import Control.Exception
 import Control.Monad   --      (unless, when, forM_, void, join)
 import Control.Monad.Trans.Maybe
 import Data.Aeson --            (FromJSON(..), ToJSON(..), (.:), (.=), (.:?), withObject, object)
-import Data.Aeson.Types      (Parser, defaultOptions, parseMaybe, parseEither)
+import Data.Aeson.Types      (Parser, parseMaybe, parseEither)
 import Data.Aeson.Key        qualified as Key
 import Data.ByteString.Char8 qualified as BS
 import Data.ByteString.Base64 qualified as B64
-import Data.Bifunctor
 import Data.Function         (on)
-import Data.Foldable         (for_,find)
+import Data.Foldable         (for_)
 import Data.Functor
 import Data.Functor.Identity
 import Data.List
 import Data.String (IsString)
-import Data.Char (Char, generalCategory, isAlphaNum, isSpace, GeneralCategory(..))
+import Data.Char (generalCategory, isAlphaNum, isSpace, GeneralCategory(..))
 import Data.Maybe            
 import Data.Ord              (Down(..))
 import Data.Time.Clock       (UTCTime, getCurrentTime, addUTCTime)
-import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Normalize as UN
-import Prelude hiding (Char)
+import Prelude hiding (log)
 import qualified Data.UUID as UUID
 import qualified Data.UUID.V4 as UUIDv4
 import qualified Data.Yaml as Yaml
-import GHC.Generics          (Generic)
 import Options.Generic
 import Network.HTTP.Simple
 import Network.HTTP.Base     (urlEncode)
 import Network.URI           (parseURI, uriPath)
-import System.Environment    (lookupEnv, getArgs, setEnv)
+import System.Environment    (lookupEnv, setEnv)
 import System.FilePath       (takeFileName, takeExtension, (</>))
 import qualified System.FilePath.Windows as W
 import System.Directory.Tree qualified as DirTree
-import System.IO             (hPutStrLn, stderr)
 import System.IO.Temp (withSystemTempDirectory)
 import System.Posix.Files (setFileMode)
 import System.Process
 import Sound.TagLib          qualified as TagLib
 
-import System.IO.Unsafe
+log :: Show a => a -> IO ()
+log msg = lookupEnv "DEBUG" >>= \case
+  Just "True" -> putStrLn $ show msg
+  _           -> pure ()
 
 -- | Bidirectional pattern synonym for 'empty' and 'null' (both /O(1)/),
 -- to be used together with '(:<)' or '(:>)'.
@@ -309,15 +308,15 @@ cancelDownload dl = do
       urlPost   = urlDelete <> "/cancel"
   eres <- try . httpNoBody <=< authed . setRequestMethod "DELETE" . parseRequest_ $ urlDelete
   case eres of
-    Right _ -> putStrLn $ "Canceled (DELETE): " <> show dl
+    Right _ -> log ("Canceled (DELETE)",dl)
     Left (_ :: SomeException) -> do
       -- fallback: POST …/cancel
-      putStrLn $ "DELETE failed; trying POST cancel for " <> show dl
+      log ("DELETE failed; trying POST cancel",dl)
       rsp <- httpNoBody <=< authed . setRequestMethod "POST" . parseRequest_ $ urlPost
       let status = getResponseStatusCode rsp
       if status >= 200 && status < 300
-        then putStrLn $ "Canceled (POST): " <> show dl
-        else putStrLn $ "Cancel failed, status " <> show status <> " for " <> show dl
+        then log ("Canceled (POST)",dl)
+        else log ("Cancel failed",rsp,dl)
 
 -- enqueue body
 newtype EnqueueRequest = EnqueueRequest { file :: FileRef }
@@ -346,20 +345,16 @@ getJSON url = do
   req <- authed =<< parseRequest url
   getResponseBody <$> httpJSON req
 
-postJSON_ :: ToJSON a => String -> a -> IO ()
+postJSON_ :: ToJSON a => String -> a -> IO Bool
 postJSON_ url body = do
   req <- authed . setRequestMethod "POST" . setRequestBodyJSON body =<< parseRequest url
   rsp <- httpLbs req
   let status = getResponseStatusCode rsp
-  unless (status >= 200 && status < 300) $
-    fail ("post failed: " <> "\n" <> show rsp <> "\nbody:" <> show (getResponseBody rsp))
+  let success = (status >= 200 && status < 300)
+  unless success $ log ("post failed: " <> "\n" <> show rsp <> "\nbody:" <> show (getResponseBody rsp))
+  pure success
 
 -- === matching + ranking ===
-
-trk a = trkWith "" a
-trkId a = trk a a
-trkWith l a b = unsafePerformIO (putStrLn (l <> show a) $> b)
-trkWithId l a = trkWith l a a
 
 isMatchOf :: Track -> Source -> Bool
 isMatchOf t src =
@@ -402,12 +397,13 @@ prioritize t = sortOn $ \src ->
 
 search :: Track -> IO [Source]
 search t = do
+    putStrLn $ "Searching for " <> show t
+
     sid <- UUID.toString <$> UUIDv4.nextRandom
     let sidPath    = urlEncode sid
         searchUrl  = apiV0 <> "/searches"
         searchText = t.artist.getTag <> " - " <> t.trackName.getTag
-    putStrLn $ "searching for " <> show t
-    postJSON_ searchUrl $ object
+    success <- postJSON_ searchUrl $ object
       [ "id"                         .= sid
       , "searchText"                 .= searchText
       , "fileLimit"                  .= (10000 :: Int)
@@ -419,38 +415,38 @@ search t = do
       , "responseLimit"              .= (100 :: Int)
       , "searchTimeout"              .= (15000 :: Int)
       ]
-    results <- pollJSON (searchUrl <> "/" <> sidPath <> "/responses") 6 10000000
-    putStrLn $ "results: " <> show results
-    putStrLn $ "filtered: " <> show (filter (isMatchOf t) . join $ expand <$> results)
-    pure . filter (isMatchOf t) . join $ expand <$> results
+
+    if not success then pure [] else do
+      results <- pollJSON (searchUrl <> "/" <> sidPath <> "/responses") 6 10000000
+      let filtered = filter (isMatchOf t) . join $ expand <$> results
+
+      putStrLn $ show (length results) <> " results"
+      log results
+      putStrLn $ show (length filtered) <> " after filtering"
+      log filtered
+
+      pure . filter (isMatchOf t) . join $ expand <$> results
   where
     -- simple poller: try n times, sleep d µs between, return first successful parse
     pollJSON :: String -> Int -> Int -> IO [SearchResponse]
     pollJSON url tries delayUs = go tries
       where
-        go 0 = [] <$ putStrLn ("search: no results for " <> show t)
+        go 0 = pure []
         go n = threadDelay delayUs >> getJSON url >>= \case
-          xs@(_:_) -> xs       <$ putStrLn ("got " <> show (length xs) <> " results for " <> show t)
-          _        -> go (n-1) <* putStrLn ("no results, waiting: " <> show t)
+          xs@(_:_) -> pure xs
+          _        -> go (n-1)
 
 -- download the first viable result; timeout each candidate; move on if stalled
 download :: [Source] -> IO (Maybe FilePath)
-download []     = Nothing <$ putStrLn "failed to download"
-download (r:rs) = downloadOne 30 r >>= \case    -- seconds per candidate
-  Just p  -> putStrLn ("Downloaded: " <> p)                    >> pure (Just p)
-  Nothing -> putStrLn "Download timed out, trying next source" >> download rs
-
--- download :: [Source] -> IO (Maybe FilePath)
--- download srcs = runMaybeT (asum (MaybeT . downloadOne 30 <$> srcs)) >>= \case
---   Just file -> Just file <$ putStrLn ("downloaded: " <> file)
---   Nothing   -> Nothing   <$ putStrLn ("failed to download: " <> show srcs)
-
+download srcs = runMaybeT . asum $ MaybeT . downloadOne 30 <$> srcs
 
 downloadOne :: Int -> Source -> IO (Maybe FilePath)
 downloadOne seconds src = do
-    putStrLn $ "trying to download " <> show src
-    postJSON_ downloadsUrl $ EnqueueRequest src.file
-    loop =<< Just . addUTCTime (fromIntegral seconds) <$> getCurrentTime
+    log ("Trying to download",src)
+    success <- postJSON_ downloadsUrl $ EnqueueRequest src.file
+    if not success
+      then pure Nothing
+      else loop =<< Just . addUTCTime (fromIntegral seconds) <$> getCurrentTime
   where
     downloadsUrl = apiV0 <> "/transfers/downloads/" <> urlEncode src.username
 
@@ -464,13 +460,13 @@ downloadOne seconds src = do
 
       case find relevant ds of
         Just d@Download{status = Just st, speed, bytesDone}
-          | "Complete"   `isPrefixOf` st -> putStrLn "Complete" $> Just (inferPath d)
-          | "Failed"     `isPrefixOf` st -> putStrLn "Failed"   $> Nothing
+          | any (`isInfixOf` st) ["Failed","Rejected"] -> log ("Failed",d)   $> Nothing
+          | "Complete"   `isPrefixOf` st               -> log ("Complete",d) $> Just (inferPath d)
           | "InProgress" `isInfixOf`  st -> do
-              putStrLn $ "Downloading: " <> show (speed, bytesDone)
+              log ("Waiting",d)
               threadDelay 300000
               loop Nothing
-        dl | timedOut  -> Nothing <$ (putStrLn "Timed out" >> for_ dl cancelDownload)
+        dl | timedOut  -> Nothing <$ (putStrLn "Timed out, trying next..." >> for_ dl cancelDownload)
            | otherwise -> do
               let newDeadline = mDeadline <|> Just (addUTCTime (fromIntegral seconds) now)
               threadDelay 300000
@@ -483,8 +479,7 @@ downloadOne seconds src = do
       concat <$> forM dirs (withObject "dir" $ \d -> d .:? "files" .!= [])
 
     inferPath :: Download -> FilePath
-    inferPath d = trk ("infer from: " <> show d) $
-                  let folder = W.takeFileName . W.takeDirectory $ d.filename
+    inferPath d = let folder = W.takeFileName . W.takeDirectory $ d.filename
                       file   = W.takeFileName d.filename
                   in fromMaybe (downloadsDir </> folder </> file) d.destination
 
@@ -506,21 +501,18 @@ getTrack _ = pure Nothing
 
 retag :: Track -> FilePath -> IO ()
 retag track filePath = do
-  putStrLn $ "retagging: " <> filePath
+  putStrLn $ "Retagging: " <> filePath
   mTagFile <- TagLib.open filePath
   case mTagFile of
-    Nothing -> putStrLn "no tagfile"
-    Just tagFile -> do
-      putStrLn $ "tagFile: " <> show tagFile
-      mTag <- TagLib.tag tagFile
-      case mTag of
-        Nothing -> putStrLn "no tag"
-        Just tag -> do
-          TagLib.setTitle tag . show $ track.trackName.getTag
-          TagLib.setArtist tag . show $ track.artist.getTag
-          TagLib.setAlbum tag . show $ track.album.getTag
-          void $ TagLib.save tagFile
-          putStrLn $ "Tags rewritten for: " ++ filePath
+    Nothing -> putStrLn "No tagfile"
+    Just tagFile -> TagLib.tag tagFile >>= \case
+      Nothing -> putStrLn "No tag"
+      Just tag -> do
+        TagLib.setTitle tag . show $ track.trackName.getTag
+        TagLib.setArtist tag . show $ track.artist.getTag
+        TagLib.setAlbum tag . show $ track.album.getTag
+        void $ TagLib.save tagFile
+        putStrLn $ "Retagged: " <> filePath
 
 
 readPlaylist :: String -> String -> String -> IO [Track]
@@ -576,18 +568,18 @@ genConfig key = object
       ]
   ]
 
-withSlskd :: FilePath -> [FilePath] -> IO a -> IO a
-withSlskd downloadsDir shared action = do
+withSlskd :: String -> String -> FilePath -> [FilePath] -> IO a -> IO a
+withSlskd username password downloadsDir shared action = do
     secret <- UUID.toString <$> UUIDv4.nextRandom
 
     withSystemTempDirectory "slskd-" $ \tmp -> do
       let cfg  = tmp </> "slskd.yml"
           args = concat
-            [ ["--config",cfg]
+            [ ["--config",cfg,"--no-logo"]
             , ["--headless","--http-port","5030","--no-https"]
             , ["--downloads", downloadsDir]
             , if null shared then [] else "--shared":shared
-            , ["--slsk-username","piracyiscool","--slsk-password","kopimism"]
+            , ["--slsk-username",username,"--slsk-password",password]
             ]
       Yaml.encodeFile cfg $ genConfig secret
       setFileMode cfg 0o600
@@ -598,22 +590,41 @@ withSlskd downloadsDir shared action = do
         (const $ waitForHealth >> setEnv "SLSKD_API_KEY" secret >> action)
 
 data Cmd = Cmd { playlist :: String, clientId :: String, clientSecret :: String
-               , downloads :: FilePath, shared :: [FilePath] }
+               , username :: String, password :: String
+               , downloads :: FilePath, shared :: [FilePath]
+               , debug :: Bool }
   deriving (Show, Generic)
 instance ParseRecord Cmd where parseRecord = parseRecordWithModifiers lispCaseModifiers
+
+getMissing :: FilePath -> [Track] -> IO [Track]
+getMissing downloadsDir playlist = do
+  existingTracks <- fmap catMaybes . mapM getTrack
+                  . DirTree.flattenDir . (.dirTree)
+                =<< DirTree.build downloadsDir
+  putStrLn $ "local tracks: " <> show (length existingTracks)
+
+  let (have,missing) = partition (`elem` existingTracks) playlist
+  putStrLn $ " have tracks: " <> show (length have)
+  putStrLn $ " miss tracks: " <> show (length missing)
+
+  pure missing
 
 main :: IO ()
 main = do
   Cmd{..} <- getRecord "playlist-pl"
 
+  setEnv "DEBUG" $ show debug
+
   playlist <- readPlaylist playlist clientId clientSecret
-  putStrLn $ "need tracks: " <> show (length playlist)
+  putStrLn $ " list tracks: " <> show (length playlist)
 
-  existingTracks <- fmap catMaybes . mapM getTrack . DirTree.flattenDir . (.dirTree) =<< DirTree.build downloads
-  putStrLn $ "have tracks: " <> show (length existingTracks)
+  missing <- getMissing downloadsDir playlist
 
-  let missing = filter (`notElem` existingTracks) playlist
-  putStrLn $ "miss tracks: " <> show (length missing)
+  withSlskd username password downloads shared $
+    forM_ missing $ \track -> search track >>= download . prioritize track
+                          >>= maybe (putStrLn $ "Couldn't download " <> show track)
+                              (retag track)
 
-  withSlskd downloads shared $ do
-    forM_ missing $ \track -> search track >>= download . prioritize track >>= traverse (retag track)
+  putStrLn "FINISHED! Still missing:"
+  mapM_ (putStrLn . show) =<< getMissing downloadsDir playlist
+  
