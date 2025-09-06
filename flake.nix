@@ -1,5 +1,5 @@
 {
-  description = "playlist-dl";
+  description = "playlist-sync";
 
   inputs = {
     nixpkgs.url     = "github:NixOS/nixpkgs/nixos-25.05";
@@ -47,41 +47,41 @@
             then slskd-darwin { }
             else pkgs.slskd;
 
-          # playlist-dl
+          # playlist-sync
           hpkgs = pkgs.haskellPackages;
 
-          playlist-dl = pkgs.haskell.lib.overrideCabal
-            (hpkgs.callCabal2nix "playlist-dl" ./. { })
+          playlist-sync = pkgs.haskell.lib.overrideCabal
+            (hpkgs.callCabal2nix "playlist-sync" ./. { })
             (old: {
               librarySystemDepends    = (old.librarySystemDepends or [])    ++ [ pkgs.taglib pkgs.zlib ];
               executableSystemDepends = (old.executableSystemDepends or []) ++ [ pkgs.taglib pkgs.zlib ];
               buildTools              = (old.buildTools or [])              ++ [ pkgs.pkg-config ];
             });
 
-          # playlist-dl with slskd on the path
-          playlist-dl-with-slskd = pkgs.stdenvNoCC.mkDerivation {
-            pname = "playlist-dl-with-slskd";
+          # playlist-sync with slskd on the path
+          playlist-sync-with-slskd = pkgs.stdenvNoCC.mkDerivation {
+            pname = "playlist-sync-with-slskd";
             version = "wrapped";
             dontUnpack = true;
             nativeBuildInputs = [ pkgs.makeWrapper ];
             installPhase = ''
               mkdir -p $out/bin
-              makeWrapper ${playlist-dl}/bin/playlist-dl \
-                $out/bin/playlist-dl \
+              makeWrapper ${playlist-sync}/bin/playlist-sync \
+                $out/bin/playlist-sync \
                 --prefix PATH : "${pkgs.lib.makeBinPath [ slskdPkg ]}"
             '';
           };
         in
         {
           packages = {
-            default               = playlist-dl-with-slskd;
-            playlist-dl           = playlist-dl;
+            default               = playlist-sync-with-slskd;
+            playlist-sync         = playlist-sync;
             slskd                 = slskdPkg;
           };
 
           apps = {
-            default = { type = "app"; program = "${playlist-dl-with-slskd}/bin/playlist-dl"; };
-            playlist-dl = { type = "app"; program = "${playlist-dl}/bin/playlist-dl"; };
+            default = { type = "app"; program = "${playlist-sync-with-slskd}/bin/playlist-sync"; };
+            playlist-sync = { type = "app"; program = "${playlist-sync}/bin/playlist-sync"; };
             slskd = { type = "app"; program = "${slskdPkg}/bin/slskd"; };
           };
 

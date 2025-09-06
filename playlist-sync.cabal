@@ -3,7 +3,7 @@ name: playlist-dl
 version: 0.1.0.0
 build-type: Simple
 
-executable playlist-dl
+executable playlist-sync
   hs-source-dirs: app
   main-is: Main.hs
   default-extensions: GHC2021
