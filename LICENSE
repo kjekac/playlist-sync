@@ -1,0 +1,53 @@
+Patch-Friendly NonCommercial License
+====================================
+
+This project is licensed under the Creative Commons
+Attribution–NonCommercial–NoDerivatives 4.0 International License
+(CC BY-NC-ND 4.0), with the following explicit clarifications:
+
+1. Standard Terms (from CC BY-NC-ND 4.0)
+----------------------------------------
+- Attribution — You must give appropriate credit, provide a link to
+  the license, and indicate if changes were made.  
+- NonCommercial — You may not use the material for commercial purposes.  
+- NoDerivatives — You may not share modified or adapted versions of the
+  work in whole or in part.  
+- No additional restrictions — You may not apply legal terms or
+  technological measures that legally restrict others from doing
+  anything the license permits.
+
+Full legal text: https://creativecommons.org/licenses/by-nc-nd/4.0/legalcode
+
+2. Clarification on Patches
+---------------------------
+To support collaborative development while preserving the integrity of
+the original work:
+
+- You MAY create and distribute patch files (e.g. diffs, changesets,
+  commits) that describe modifications to this project.  
+- A patch file is considered your own original work, not a derivative
+  work of this project, provided it does not contain substantial
+  portions of the original code verbatim.  
+- You MAY circulate patches under any license of your choosing.  
+- You MAY NOT distribute built artifacts, compiled binaries, or complete
+  modified source trees incorporating this project without explicit
+  written permission from the copyright holder(s). Doing so constitutes
+  distribution of a derivative work and is prohibited under the base
+  CC BY-NC-ND license.
+
+3. Encouragement
+----------------
+For maximum transparency and collaboration, contributors are encouraged
+to share and exchange their work as patch sets using patch-centric
+version control systems (such as Jujutsu, Quilt, Darcs, or similar).
+This ensures that modifications remain auditable, remixable, and clearly
+separated from the canonical source.
+
+4. Summary
+----------
+- Sharing original source: permitted under CC BY-NC-ND.  
+- Sharing patches: permitted and encouraged.  
+- Sharing full modified versions or binaries: prohibited without
+  permission.  
+- Commercial use of any kind: prohibited without permission.  
+
