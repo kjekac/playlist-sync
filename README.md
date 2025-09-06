@@ -1,14 +1,14 @@
-you need nix. then run with
+you need nix with flakes enabled. this ensures the build is deterministic. then you can run everything with a single command:
 
 ```sh
 nix run . -- \
   --playlist <spotify url> \
   --client-id <get this from api.spotify.com> \
   --client-secret <get this from api.spotify.com> \
-  --username <soulseek username> \  # you can set these to literally anything
-  --password <soulseek password> \  # or just use the same as in soulseekqt
+  --username <soulseek username> \  # you can set these to literally anything...
+  --password <soulseek password> \  # ...or just use the same as in soulseekqt
   --downloads <target folder> \
-  [ --shared <share folder> \       # optional but peers often require that you share stuff
+  [ --shared <share folder> ] \     # optional but peers often require that you share stuff
   [ --debug ]                       # optional
 ```
 
