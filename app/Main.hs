@@ -526,7 +526,7 @@ retag Track{title=Title title,artist=Artist artist,album=Album album} filePath =
   putStrLn $ "new: " <> show new
 
 
-readPlaylist :: String -> String -> String -> IO [Track]
+readPlaylist :: String -> String -> String -> IO (String, [Track])
 readPlaylist playlistURL clientId clientSecret = do
     let Just playlistId@(_:_) = takeFileName . uriPath <$> parseURI playlistURL
 
@@ -538,7 +538,7 @@ readPlaylist playlistURL clientId clientSecret = do
     let status = getResponseStatusCode response
     unless (status >= 200 && status < 300) $ error ("getting playlist tracks failed: " <> show response)
 
-    pure . extractSpotifyTracks . getResponseBody $ response
+    pure (playlistId, extractSpotifyTracks . getResponseBody $ response)
   where
     getSpotifyBearer :: IO BS.ByteString
     getSpotifyBearer = do
@@ -615,7 +615,7 @@ getTrack path = HTagLib.getTags path
             <*> fmap Album    HTagLib.albumGetter
             <*> fmap Duration HTagLib.durationGetter
 
-getMissing :: FilePath -> [Track] -> IO [Track]
+getMissing :: FilePath -> [Track] -> IO ([Track], [Track])
 getMissing downloadsDir playlist = do
   existingTracks <- mapM getTrack . mapMaybe (\case {DirTree.File _ file -> Just file; _ -> Nothing})
                   . DirTree.flattenDir . (.dirTree) =<< DirTree.build downloadsDir
@@ -625,11 +625,34 @@ getMissing downloadsDir playlist = do
   putStrLn $ " have tracks: " <> show (length have)
   putStrLn $ " miss tracks: " <> show (length missing)
 
-  pure missing
+  pure (have, missing)
 
 expandTilde :: FilePath -> IO FilePath
 expandTilde ('~':path) = getHomeDirectory <&> (</> path)
 expandTilde path       = pure path
+
+createM3uPlaylist :: FilePath -> String -> [Track] -> IO ()
+createM3uPlaylist downloadsDir playlistId tracks = do
+  files <- mapMaybe (\case {DirTree.File _ file -> Just file; _ -> Nothing})
+         . DirTree.flattenDir . (.dirTree) <$> DirTree.build downloadsDir
+  trackFiles <- filterM (\f -> (`elem` tracks) <$> getTrack f) files
+
+  let m3uPath = downloadsDir </> playlistId <> ".m3u"
+      m3uContent = "#EXTM3U\n" <> concatMap formatTrack trackFiles
+
+  writeFile m3uPath m3uContent
+  putStrLn $ "Created playlist: " <> m3uPath <> " with " <> show (length trackFiles) <> " tracks"
+  where
+    formatTrack :: FilePath -> String
+    formatTrack filePath =
+      let relPath = makeRelativePath downloadsDir filePath
+      in relPath <> "\n"
+
+    makeRelativePath :: FilePath -> FilePath -> FilePath
+    makeRelativePath base path =
+      if base `isPrefixOf` path
+        then drop (length base + 1) path
+        else takeFileName path
 
 main :: IO ()
 main = do
@@ -637,19 +660,22 @@ main = do
 
   setEnv "DEBUG" $ show debug
 
-  playlist <- readPlaylist playlist clientId clientSecret
-  putStrLn $ " list tracks: " <> show (length playlist)
+  (playlistId, playlistTracks) <- readPlaylist playlist clientId clientSecret
+  putStrLn $ " list tracks: " <> show (length playlistTracks)
 
   downloadsDir <- downloads & \case
     ('~':path) -> getHomeDirectory <&> (</> path)
     _          -> pure downloads
-  missing <- getMissing downloadsDir playlist
+  (_, missing) <- getMissing downloadsDir playlistTracks
 
   withSlskd username password downloads shared $
     forM_ missing $ \track ->
       search track >>= download downloadsDir . prioritize track
       >>= maybe (putStrLn $ "Couldn't download " <> show track) (retag track)
 
+  (finalHave, finalMissing) <- getMissing downloadsDir playlistTracks
+  createM3uPlaylist downloadsDir playlistId finalHave
+
   putStrLn "FINISHED! Still missing:"
-  mapM_ (putStrLn . show) =<< getMissing downloadsDir playlist
+  mapM_ (putStrLn . show) finalMissing
   
