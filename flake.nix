@@ -16,16 +16,15 @@
 
           # slskd isn't in nixpkgs on MacOS so we build from source
           slskd-darwin =
-            { rev ? "v0.23.2"
-            , srcHash ? "sha256-REPLACE_ME_SRC"
-            , vendorHash ? "sha256-REPLACE_ME_VENDOR"
+            { rev ? "0.23.2"
+            , srcHash ? "sha256-y/qgx4tC7QGQTbBqhvp/TUalW1MfKYzvvSVgyNvKMME="
             }:
-            pkgs.buildDotnetModule rec {
+            pkgs.buildDotnetModule {
               pname = "slskd";
-              version = lib.removePrefix "v" rev;
+              version = rev;
 
               src = pkgs.fetchFromGitHub {
-                owner = "slskdorg";
+                owner = "slskd";
                 repo  = "slskd";
                 rev   = rev;
                 hash  = srcHash;
@@ -37,10 +36,10 @@
               dotnet-runtime     = pkgs.dotnetCorePackages.aspnetcore_8_0;
               selfContainedBuild = false;
 
-              vendorHash = vendorHash;
+              nugetDeps = ./slskd-deps.json;
 
               executables = [ "slskd" ];
-            };
+          };
 
           slskdPkg =
             if pkgs.stdenv.isDarwin
