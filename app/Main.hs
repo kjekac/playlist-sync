@@ -14,6 +14,7 @@ module Main where
 import Control.Applicative
 
 import Control.Concurrent    (threadDelay)
+import Control.Concurrent.Async (mapConcurrently_)
 import Control.Exception
 import Control.Monad   --      (unless, when, forM_, void, join)
 import Control.Monad.Trans.Maybe
@@ -27,6 +28,7 @@ import Data.Foldable         (for_)
 import Data.Functor
 import Data.Functor.Identity
 import Data.List
+import Data.List.Split (chunksOf)
 import Data.Char (generalCategory, isAlphaNum, isSpace, GeneralCategory(..))
 import Data.Either
 import Data.Maybe            
@@ -668,8 +670,10 @@ main = do
     _          -> pure downloads
   (_, missing) <- getMissing downloadsDir playlistTracks
 
+  let missingChunks = chunksOf 10 missing
+
   withSlskd username password downloads shared $
-    forM_ missing $ \track ->
+    forM_ missingChunks $ mapConcurrently_ \track ->
       search track >>= download downloadsDir . prioritize track
       >>= maybe (putStrLn $ "Couldn't download " <> show track) (retag track)
 
