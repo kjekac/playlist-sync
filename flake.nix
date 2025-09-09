@@ -14,6 +14,15 @@
           pkgs = import nixpkgs { inherit system; };
           lib  = pkgs.lib;
 
+          # we pin an old version to guarantee that the Haskell library works everywhere.
+          taglib_1_13 = pkgs.taglib.overrideAttrs (old: {
+            version = "1.13";
+            src = pkgs.fetchurl {
+              url = "https://taglib.github.io/releases/taglib-1.13.tar.gz";
+              sha256 = "sha256-WPCLTbPcMe0VLASJbukXLSIFK8fvEoiAKMAdix1greA=";
+            };
+          });
+
           # slskd isn't in nixpkgs on MacOS so we build from source
           slskd-darwin =
             { rev ? "0.23.2"
@@ -52,8 +61,8 @@
           playlist-sync = pkgs.haskell.lib.overrideCabal
             (hpkgs.callCabal2nix "playlist-sync" ./. { })
             (old: {
-              librarySystemDepends    = (old.librarySystemDepends or [])    ++ [ pkgs.taglib pkgs.zlib ];
-              executableSystemDepends = (old.executableSystemDepends or []) ++ [ pkgs.taglib pkgs.zlib ];
+              librarySystemDepends    = (old.librarySystemDepends or [])    ++ [ taglib_1_13 pkgs.zlib ];
+              executableSystemDepends = (old.executableSystemDepends or []) ++ [ taglib_1_13 pkgs.zlib ];
               buildTools              = (old.buildTools or [])              ++ [ pkgs.pkg-config ];
             });
 
@@ -86,7 +95,7 @@
 
           devShells.default = pkgs.mkShell {
             buildInputs =
-              [ pkgs.cabal-install pkgs.pkg-config pkgs.taglib pkgs.zlib ]
+              [ pkgs.cabal-install pkgs.pkg-config taglib_1_13 pkgs.zlib ]
               ++ lib.optionals pkgs.stdenv.isDarwin [
                 pkgs.dotnetCorePackages.sdk_8_0
                 pkgs.dotnetCorePackages.aspnetcore_8_0
