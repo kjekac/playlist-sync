@@ -88,18 +88,22 @@
           };
 
           apps = {
-            default = { type = "app"; program = "${playlist-sync-with-slskd}/bin/playlist-sync"; };
+            default       = { type = "app"; program = "${playlist-sync-with-slskd}/bin/playlist-sync"; };
             playlist-sync = { type = "app"; program = "${playlist-sync}/bin/playlist-sync"; };
-            slskd = { type = "app"; program = "${slskdPkg}/bin/slskd"; };
+            slskd         = { type = "app"; program = "${slskdPkg}/bin/slskd"; };
           };
 
           devShells.default = pkgs.mkShell {
-            buildInputs =
-              [ pkgs.cabal-install pkgs.pkg-config taglib_1_13 pkgs.zlib ]
-              ++ lib.optionals pkgs.stdenv.isDarwin [
-                pkgs.dotnetCorePackages.sdk_8_0
-                pkgs.dotnetCorePackages.aspnetcore_8_0
-              ];
+            inputsFrom = [ playlist-sync.env ];
+            buildInputs = [
+              pkgs.cabal-install
+              pkgs.pkg-config
+              taglib_1_13
+              pkgs.zlib
+            ] ++ lib.optionals pkgs.stdenv.isDarwin [
+              pkgs.dotnetCorePackages.sdk_8_0
+              pkgs.dotnetCorePackages.aspnetcore_8_0
+            ];
           };
         });
 }
