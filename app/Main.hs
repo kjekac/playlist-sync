@@ -22,13 +22,14 @@ import Data.Aeson.Types      (Parser, parseMaybe, parseEither)
 import Data.Aeson.Key        qualified as Key
 import Data.ByteString.Char8 qualified as BS
 import Data.ByteString.Base64 qualified as B64
-import Data.Function         (on)
+import Data.Function         (on, (&))
 import Data.Foldable         (for_)
 import Data.Functor
 import Data.Functor.Identity
 import Data.List
 import Data.String (IsString)
 import Data.Char (generalCategory, isAlphaNum, isSpace, GeneralCategory(..))
+import Data.Either
 import Data.Maybe            
 import Data.Ord              (Down(..))
 import Data.Time.Clock       (UTCTime, getCurrentTime, addUTCTime)
@@ -46,6 +47,7 @@ import System.Environment    (lookupEnv, setEnv)
 import System.FilePath       (takeFileName, takeExtension, (</>))
 import qualified System.FilePath.Windows as W
 import System.Directory.Tree qualified as DirTree
+import System.Directory (getHomeDirectory)
 import System.IO.Temp (withSystemTempDirectory)
 import System.Posix.Files (setFileMode)
 import System.Process
@@ -330,9 +332,6 @@ apiRoot = "http://localhost:5030"
 apiV0 :: String
 apiV0  = apiRoot <> "/api/v0"
 
--- directory where slskd writes; adjust to your slskd config
-downloadsDir :: FilePath
-downloadsDir = "/home/kjekac/soulseek"
 -- === http helpers ===
 
 authed :: Request -> IO Request
@@ -455,7 +454,8 @@ downloadOne seconds src = do
     loop mDeadline = do
       now <- getCurrentTime
       v   <- getJSON downloadsUrl
-      let ds = either (const []) id $ downloadsFromEnv v
+      log ("loop got json",v)
+      let ds = fromRight [] $ downloadsFromEnv v
           timedOut = maybe False (now >) mDeadline
 
       case find relevant ds of
@@ -478,10 +478,10 @@ downloadOne seconds src = do
       dirs <- o .:? "directories" .!= []                    -- [Value]
       concat <$> forM dirs (withObject "dir" $ \d -> d .:? "files" .!= [])
 
+    -- TODO make total
     inferPath :: Download -> FilePath
-    inferPath d = let folder = W.takeFileName . W.takeDirectory $ d.filename
-                      file   = W.takeFileName d.filename
-                  in fromMaybe (downloadsDir </> folder </> file) d.destination
+    inferPath d = -- fromMaybe (downloadsDir </> folder </> file)
+                  fromJust d.destination
 
     relevant :: Download -> Bool
     relevant d = d.filename == src.file.filename && d.size == src.file.size
@@ -609,15 +609,22 @@ getMissing downloadsDir playlist = do
 
   pure missing
 
+expandTilde :: FilePath -> IO FilePath
+expandTilde ('~':path) = getHomeDirectory <&> (</> path)
+expandTilde path       = pure path
+
 main :: IO ()
 main = do
-  Cmd{..} <- getRecord "playlist-pl"
+  Cmd{..} <- getRecord "playlist-sync"
 
   setEnv "DEBUG" $ show debug
 
   playlist <- readPlaylist playlist clientId clientSecret
   putStrLn $ " list tracks: " <> show (length playlist)
 
+  downloadsDir <- downloads & \case
+    ('~':path) -> getHomeDirectory <&> (</> path)
+    _          -> pure downloads
   missing <- getMissing downloadsDir playlist
 
   withSlskd username password downloads shared $
