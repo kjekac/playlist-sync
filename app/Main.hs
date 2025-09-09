@@ -27,7 +27,6 @@ import Data.Foldable         (for_)
 import Data.Functor
 import Data.Functor.Identity
 import Data.List
-import Data.String (IsString)
 import Data.Char (generalCategory, isAlphaNum, isSpace, GeneralCategory(..))
 import Data.Either
 import Data.Maybe            
@@ -51,7 +50,7 @@ import System.Directory (getHomeDirectory)
 import System.IO.Temp (withSystemTempDirectory)
 import System.Posix.Files (setFileMode)
 import System.Process
-import Sound.TagLib          qualified as TagLib
+import Sound.HTagLib         qualified as HTagLib
 
 log :: Show a => a -> IO ()
 log msg = lookupEnv "DEBUG" >>= \case
@@ -91,11 +90,6 @@ infixl 5 :>
 
 
 -- === domain ===
-
-newtype Tag = Tag { getTag :: Text }
-  deriving (IsString, ToJSON, Semigroup)
-instance Show Tag where show = show . (.getTag)
-instance Eq   Tag where (==) = on (==) (normalizeText . (.getTag))
 
 normalizeText :: Text -> Text
 normalizeText
@@ -165,44 +159,76 @@ dropJunkSuffix s =
 spanEnd :: (Char -> Bool) -> Text -> (Text, Text)
 spanEnd f = runIdentity . T.spanEndM (pure . f)
 
-cleanQualifiers :: Text -> Text
-cleanQualifiers = T.strip . dropJunkSuffix . dropJunkBrackets
-
-cleanTag :: Text -> Tag
-cleanTag = Tag . cleanQualifiers
-
-newtype Duration = Duration Integer
-  deriving (FromJSON)
-instance Show Duration where show (Duration d) = show d <> "s"
-instance Eq   Duration where (Duration i1) == (Duration i2) = abs (i1 - i2) <= 5
-
-data Track = Track
-  { trackName :: Tag
-  , artist    :: Tag
-  , album     :: Tag
-  , duration  :: Duration
-  } deriving Eq
-
-instance Show Track where
-  show Track{..} = T.unpack $ T.concat [ artist.getTag, " - ", trackName.getTag
-                                       , " (", album.getTag, ", ", T.pack (show duration), ")"]
+cleanTag :: Text -> Text
+cleanTag = T.strip . dropJunkSuffix . dropJunkBrackets
 
 instance FromJSON Track where
   parseJSON = withObject "spotify.track" $ \v -> do
-    trackName  <- cleanTag <$> v .: "name"
-    artist     <- Tag <$> do
+    title  <- mkTitle <$> v .: "name"
+    artist     <- mkArtist <$> do
       arr <- v .: "artists" :: Parser [Value]
       artists <- mapM (withObject "artist" (\ao -> ao .: "name")) arr
       pure $ T.intercalate ", " artists
-    album     <- fmap cleanTag . withObject "album" (\ao -> ao .: "name") =<< (v .: "album")
-    duration <- Duration . (`div` 1000) <$> v .: "duration_ms"
+    album     <- fmap mkAlbum . withObject "album" (\ao -> ao .: "name") =<< (v .: "album")
+    duration <- mkDuration . (`div` 1000) <$> v .: "duration_ms"
     pure Track{..}
+
+newtype Title = Title HTagLib.Title
+instance Show Title where show = T.unpack . getTitle
+instance Eq   Title where (==) = on (==) (normalizeText . getTitle)
+
+newtype Artist = Artist HTagLib.Artist
+instance Show Artist where show = T.unpack . getArtist
+instance Eq   Artist where (==) = on (==) (normalizeText . getArtist)
+
+newtype Album = Album HTagLib.Album
+instance Show Album where show = T.unpack . getAlbum
+instance Eq   Album where (==) = on (==) (normalizeText . getAlbum)
+
+newtype Duration = Duration HTagLib.Duration
+instance Show     Duration where show = ((<>) "s") . show . getDuration
+instance Eq       Duration where d1 == d2 = abs (getDuration d1 - getDuration d2) <= 5
+instance FromJSON Duration where parseJSON = fmap mkDuration . parseJSON
+
+getTitle :: Title -> Text
+getTitle (Title t) = HTagLib.unTitle t
+
+getArtist :: Artist -> Text
+getArtist (Artist t) = HTagLib.unArtist t
+
+getAlbum :: Album -> Text
+getAlbum (Album t) = HTagLib.unAlbum t
+
+getDuration :: Duration -> Int
+getDuration (Duration d) = HTagLib.unDuration d
+
+mkTitle :: Text -> Title
+mkTitle = Title . HTagLib.mkTitle . cleanTag
+
+mkArtist :: Text -> Artist
+mkArtist = Artist . HTagLib.mkArtist . cleanTag
+
+mkAlbum :: Text -> Album
+mkAlbum = Album . HTagLib.mkAlbum . cleanTag
+
+mkDuration :: Int -> Duration
+mkDuration = Duration . fromJust . HTagLib.mkDuration
+
+data Track = Track
+  { title    :: Title
+  , artist   :: Artist
+  , album    :: Album
+  , duration :: Duration
+  } deriving Eq
+
+instance Show Track where
+  show Track{..} = concat [ show artist, " - ", show title
+                          , " (", show album, ", ", show duration, ")" ]
 
 extractSpotifyTracks :: Value -> [Track]
 extractSpotifyTracks =
   fromMaybe [] . parseMaybe (withObject "playlist" $ \o -> do
     items <- o .: "items"
-    -- items :: [Value]
     mapM (withObject "item" $ \it -> do
       tval <- it .: "track"
       parseJSON tval) items)
@@ -357,14 +383,14 @@ postJSON_ url body = do
 
 isMatchOf :: Track -> Source -> Bool
 isMatchOf t src =
-       on T.isInfixOf normalizeText t.artist.getTag    (T.pack src.file.filename)
-    && on T.isInfixOf normalizeText t.album.getTag     (T.pack $ W.takeDirectory src.file.filename)
-    && on T.isInfixOf normalizeText t.trackName.getTag (T.pack $ W.takeFileName src.file.filename)
+       on T.isInfixOf normalizeText (getArtist t.artist) (T.pack src.file.filename)
+    && on T.isInfixOf normalizeText (getAlbum t.album)   (T.pack $ W.takeDirectory src.file.filename)
+    && on T.isInfixOf normalizeText (getTitle t.title)   (T.pack $ W.takeFileName src.file.filename)
     && and (src.file.attributes >>= (.aDuration) <&> (== t.duration))
 
-
 estimateKbps :: Integer -> Duration -> Int
-estimateKbps bytes (Duration durSec) =
+estimateKbps bytes duration =
+  let durSec = getDuration duration in
   if durSec <= 0 then 0
   else round ((fromIntegral bytes * 8) / (fromIntegral durSec * 1000) :: Double)
 
@@ -385,14 +411,12 @@ formatRank t f =
         "mp3"              -> 10
         _                  -> 40
 
-
 prioritize :: Track -> [Source] -> [Source]
 prioritize t = sortOn $ \src ->
   ( Down $ formatRank t src.file
   , Down src.freeUploadSlots
   , src.queueLength
   , Down src.uploadSpeed )
-
 
 search :: Track -> IO [Source]
 search t = do
@@ -401,7 +425,7 @@ search t = do
     sid <- UUID.toString <$> UUIDv4.nextRandom
     let sidPath    = urlEncode sid
         searchUrl  = apiV0 <> "/searches"
-        searchText = t.artist.getTag <> " - " <> t.trackName.getTag
+        searchText = show t.artist <> " - " <> show t.title
     success <- postJSON_ searchUrl $ object
       [ "id"                         .= sid
       , "searchText"                 .= searchText
@@ -436,11 +460,11 @@ search t = do
           _        -> go (n-1)
 
 -- download the first viable result; timeout each candidate; move on if stalled
-download :: [Source] -> IO (Maybe FilePath)
-download srcs = runMaybeT . asum $ MaybeT . downloadOne 30 <$> srcs
+download :: FilePath -> [Source] -> IO (Maybe FilePath)
+download dest srcs = runMaybeT . asum $ MaybeT . downloadOne 30 dest <$> srcs
 
-downloadOne :: Int -> Source -> IO (Maybe FilePath)
-downloadOne seconds src = do
+downloadOne :: Int -> FilePath -> Source -> IO (Maybe FilePath)
+downloadOne seconds downloadsDir src = do
     log ("Trying to download",src)
     success <- postJSON_ downloadsUrl $ EnqueueRequest src.file
     if not success
@@ -461,7 +485,7 @@ downloadOne seconds src = do
       case find relevant ds of
         Just d@Download{status = Just st, speed, bytesDone}
           | any (`isInfixOf` st) ["Failed","Rejected"] -> log ("Failed",d)   $> Nothing
-          | "Complete"   `isPrefixOf` st               -> log ("Complete",d) $> Just (inferPath d)
+          | "Complete"   `isPrefixOf` st               -> log ("Complete",d) $> Just (destination d)
           | "InProgress" `isInfixOf`  st -> do
               log ("Waiting",d)
               threadDelay 300000
@@ -478,41 +502,28 @@ downloadOne seconds src = do
       dirs <- o .:? "directories" .!= []                    -- [Value]
       concat <$> forM dirs (withObject "dir" $ \d -> d .:? "files" .!= [])
 
-    -- TODO make total
-    inferPath :: Download -> FilePath
-    inferPath d = -- fromMaybe (downloadsDir </> folder </> file)
-                  fromJust d.destination
+    -- We need to decompose the path because we don't know if it's Windows or Posix
+    destination :: Download -> FilePath
+    destination d = let folder = W.takeFileName . W.takeDirectory $ d.filename
+                        file   = W.takeFileName d.filename
+                    in downloadsDir </> folder </> file
 
     relevant :: Download -> Bool
     relevant d = d.filename == src.file.filename && d.size == src.file.size
 
--- TODO fix incomplete patterns
-getTrack :: DirTree.DirTree FilePath -> IO (Maybe Track)
-getTrack DirTree.File{file} = Just <$> do
-  Just tagFile <- TagLib.open file
-  Just tag     <- TagLib.tag tagFile
-  Just props   <- TagLib.audioProperties tagFile
-  trackName    <- Tag . T.pack <$> TagLib.title tag
-  artist       <- Tag . T.pack <$> TagLib.artist tag
-  album        <- Tag . T.pack <$> TagLib.album tag
-  duration     <- Duration <$> TagLib.duration props
-  pure Track{..}
-getTrack _ = pure Nothing
-
 retag :: Track -> FilePath -> IO ()
-retag track filePath = do
+retag Track{title=Title title,artist=Artist artist,album=Album album} filePath = do
   putStrLn $ "Retagging: " <> filePath
-  mTagFile <- TagLib.open filePath
-  case mTagFile of
-    Nothing -> putStrLn "No tagfile"
-    Just tagFile -> TagLib.tag tagFile >>= \case
-      Nothing -> putStrLn "No tag"
-      Just tag -> do
-        TagLib.setTitle tag . show $ track.trackName.getTag
-        TagLib.setArtist tag . show $ track.artist.getTag
-        TagLib.setAlbum tag . show $ track.album.getTag
-        void $ TagLib.save tagFile
-        putStrLn $ "Retagged: " <> filePath
+  threadDelay 10000
+  old <- getTrack filePath
+  HTagLib.setTags filePath Nothing
+     $ HTagLib.titleSetter title
+    <> HTagLib.artistSetter artist
+    <> HTagLib.albumSetter album
+  new <- getTrack filePath
+  putStrLn $ "Retagged: " <> filePath
+  putStrLn $ "old: " <> show old
+  putStrLn $ "new: " <> show new
 
 
 readPlaylist :: String -> String -> String -> IO [Track]
@@ -596,11 +607,18 @@ data Cmd = Cmd { playlist :: String, clientId :: String, clientSecret :: String
   deriving (Show, Generic)
 instance ParseRecord Cmd where parseRecord = parseRecordWithModifiers lispCaseModifiers
 
+getTrack :: FilePath -> IO Track
+getTrack path = HTagLib.getTags path
+              $ Track
+            <$> fmap Title    HTagLib.titleGetter
+            <*> fmap Artist   HTagLib.artistGetter
+            <*> fmap Album    HTagLib.albumGetter
+            <*> fmap Duration HTagLib.durationGetter
+
 getMissing :: FilePath -> [Track] -> IO [Track]
 getMissing downloadsDir playlist = do
-  existingTracks <- fmap catMaybes . mapM getTrack
-                  . DirTree.flattenDir . (.dirTree)
-                =<< DirTree.build downloadsDir
+  existingTracks <- mapM getTrack . mapMaybe (\case {DirTree.File _ file -> Just file; _ -> Nothing})
+                  . DirTree.flattenDir . (.dirTree) =<< DirTree.build downloadsDir
   putStrLn $ "local tracks: " <> show (length existingTracks)
 
   let (have,missing) = partition (`elem` existingTracks) playlist
@@ -628,9 +646,9 @@ main = do
   missing <- getMissing downloadsDir playlist
 
   withSlskd username password downloads shared $
-    forM_ missing $ \track -> search track >>= download . prioritize track
-                          >>= maybe (putStrLn $ "Couldn't download " <> show track)
-                              (retag track)
+    forM_ missing $ \track ->
+      search track >>= download downloadsDir . prioritize track
+      >>= maybe (putStrLn $ "Couldn't download " <> show track) (retag track)
 
   putStrLn "FINISHED! Still missing:"
   mapM_ (putStrLn . show) =<< getMissing downloadsDir playlist
