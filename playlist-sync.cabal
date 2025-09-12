@@ -31,5 +31,7 @@ executable playlist-sync
     , unix
     , temporary
     , directory
-    , async
-    , split
+    , extra
+    , unordered-containers
+    , hashable
+    , async-extra

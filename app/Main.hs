@@ -8,18 +8,21 @@
 {-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE ViewPatterns #-}
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+
 
 module Main where
 
 import Control.Applicative
-
 import Control.Concurrent    (threadDelay)
-import Control.Concurrent.Async (mapConcurrently_)
+import Control.Concurrent.Async.Extra (mapConcurrentlyBounded)
 import Control.Exception
 import Control.Monad   --      (unless, when, forM_, void, join)
+import Control.Monad.Trans.Class
 import Control.Monad.Trans.Maybe
 import Data.Aeson --            (FromJSON(..), ToJSON(..), (.:), (.=), (.:?), withObject, object)
 import Data.Aeson.Types      (Parser, parseMaybe, parseEither)
+import Data.Aeson.KeyMap     qualified as KM
 import Data.Aeson.Key        qualified as Key
 import Data.ByteString.Char8 qualified as BS
 import Data.ByteString.Base64 qualified as B64
@@ -27,10 +30,12 @@ import Data.Function         (on, (&))
 import Data.Foldable         (for_)
 import Data.Functor
 import Data.Functor.Identity
+import Data.Hashable
+import Data.HashMap.Strict   qualified as HM
 import Data.List
-import Data.List.Split (chunksOf)
 import Data.Char (generalCategory, isAlphaNum, isSpace, GeneralCategory(..))
 import Data.Either
+import Data.Either.Extra
 import Data.Maybe            
 import Data.Ord              (Down(..))
 import Data.Time.Clock       (UTCTime, getCurrentTime, addUTCTime)
@@ -48,7 +53,7 @@ import System.Environment    (lookupEnv, setEnv)
 import System.FilePath       (takeFileName, takeExtension, (</>))
 import qualified System.FilePath.Windows as W
 import System.Directory.Tree qualified as DirTree
-import System.Directory (getHomeDirectory)
+import System.Directory (getHomeDirectory, removeFile)
 import System.IO.Temp (withSystemTempDirectory)
 import System.Posix.Files (setFileMode)
 import System.Process
@@ -175,21 +180,20 @@ instance FromJSON Track where
     duration <- mkDuration . (`div` 1000) <$> v .: "duration_ms"
     pure Track{..}
 
-newtype Title = Title HTagLib.Title
-instance Show Title where show = T.unpack . getTitle
-instance Eq   Title where (==) = on (==) (normalizeText . getTitle)
+newtype Title = Title HTagLib.Title deriving (Eq,Generic)
+instance Show     Title where show = T.unpack . getTitle
+instance Hashable Title where hashWithSalt s = hashWithSalt s . getTitle
 
-newtype Artist = Artist HTagLib.Artist
-instance Show Artist where show = T.unpack . getArtist
-instance Eq   Artist where (==) = on (==) (normalizeText . getArtist)
+newtype Artist = Artist HTagLib.Artist deriving (Eq,Generic)
+instance Show     Artist where show = T.unpack . getArtist
+instance Hashable Artist where hashWithSalt s = hashWithSalt s . getArtist
 
-newtype Album = Album HTagLib.Album
-instance Show Album where show = T.unpack . getAlbum
-instance Eq   Album where (==) = on (==) (normalizeText . getAlbum)
+newtype Album = Album HTagLib.Album deriving (Eq,Generic)
+instance Show     Album where show = T.unpack . getAlbum
+instance Hashable Album where hashWithSalt s = hashWithSalt s . getAlbum
 
-newtype Duration = Duration HTagLib.Duration
+newtype Duration = Duration HTagLib.Duration deriving (Eq,Generic)
 instance Show     Duration where show = ((<>) "s") . show . getDuration
-instance Eq       Duration where d1 == d2 = abs (getDuration d1 - getDuration d2) <= 5
 instance FromJSON Duration where parseJSON = fmap mkDuration . parseJSON
 
 getTitle :: Title -> Text
@@ -221,11 +225,23 @@ data Track = Track
   , artist   :: Artist
   , album    :: Album
   , duration :: Duration
-  } deriving Eq
+  }
 
 instance Show Track where
   show Track{..} = concat [ show artist, " - ", show title
                           , " (", show album, ", ", show duration, ")" ]
+
+data TrackKey = TrackKey
+  { title  :: Title
+  , artist :: Artist
+  , album  :: Album
+  } deriving (Eq, Generic)
+instance Hashable TrackKey
+
+trackKey :: Track -> TrackKey
+trackKey Track{..} = TrackKey (mkTitle  . normalizeText . getTitle  $ title)
+                              (mkArtist . normalizeText . getArtist $ artist)
+                              (mkAlbum  . normalizeText . getAlbum  $ album)
 
 extractSpotifyTracks :: Value -> [Track]
 extractSpotifyTracks =
@@ -255,7 +271,7 @@ data Attributes = Attributes
   , aDuration   :: Maybe Duration -- seconds
   , aSampleRate :: Maybe Int      -- Hz (lossless only)
   , aBitDepth   :: Maybe Int      -- bits (lossless only)
-  } deriving (Show, Eq)
+  } deriving Show
 
 instance FromJSON Attributes where
   parseJSON = withObject "Attributes" $ \o -> do
@@ -420,8 +436,8 @@ prioritize t = sortOn $ \src ->
   , src.queueLength
   , Down src.uploadSpeed )
 
-search :: Track -> IO [Source]
-search t = do
+search :: Track -> MaybeT IO [Source]
+search t = lift do
     putStrLn $ "Searching for " <> show t
 
     sid <- UUID.toString <$> UUIDv4.nextRandom
@@ -445,9 +461,9 @@ search t = do
       results <- pollJSON (searchUrl <> "/" <> sidPath <> "/responses") 6 10000000
       let filtered = filter (isMatchOf t) . join $ expand <$> results
 
-      putStrLn $ show (length results) <> " results"
+      putStrLn $ show (length results) <> " results for " <> show t
       log results
-      putStrLn $ show (length filtered) <> " after filtering"
+      putStrLn $ show (length filtered) <> " after filtering for " <> show t
       log filtered
 
       pure . filter (isMatchOf t) . join $ expand <$> results
@@ -462,11 +478,11 @@ search t = do
           _        -> go (n-1)
 
 -- download the first viable result; timeout each candidate; move on if stalled
-download :: FilePath -> [Source] -> IO (Maybe FilePath)
-download dest srcs = runMaybeT . asum $ MaybeT . downloadOne 30 dest <$> srcs
+download :: FilePath -> [Source] -> MaybeT IO FilePath
+download dest srcs = asum $ downloadOne 30 dest <$> srcs
 
-downloadOne :: Int -> FilePath -> Source -> IO (Maybe FilePath)
-downloadOne seconds downloadsDir src = do
+downloadOne :: Int -> FilePath -> Source -> MaybeT IO FilePath
+downloadOne seconds downloadsDir src = MaybeT do
     log ("Trying to download",src)
     success <- postJSON_ downloadsUrl $ EnqueueRequest src.file
     if not success
@@ -475,7 +491,6 @@ downloadOne seconds downloadsDir src = do
   where
     downloadsUrl = apiV0 <> "/transfers/downloads/" <> urlEncode src.username
 
-    -- 'deadline' is active when we're NOT in progress. When we observe InProgress, we set it to Nothing.
     loop :: Maybe UTCTime -> IO (Maybe FilePath)
     loop mDeadline = do
       now <- getCurrentTime
@@ -484,11 +499,13 @@ downloadOne seconds downloadsDir src = do
       let ds = fromRight [] $ downloadsFromEnv v
           timedOut = maybe False (now >) mDeadline
 
+      -- 'deadline' is active when we're NOT in progress. When we observe InProgress, we set it to Nothing.
       case find relevant ds of
         Just d@Download{status = Just st, speed, bytesDone}
-          | any (`isInfixOf` st) ["Failed","Rejected"] -> log ("Failed",d)   $> Nothing
-          | "Complete"   `isPrefixOf` st               -> log ("Complete",d) $> Just (destination d)
-          | "InProgress" `isInfixOf`  st -> do
+          | any (`isInfixOf` st)
+            ["Failed","Rejected","Error"] -> log ("Failed",d)   $> Nothing
+          | "Complete"   `isPrefixOf` st  -> log ("Complete",d) $> Just (destination d)
+          | "InProgress" `isInfixOf`  st  -> do
               log ("Waiting",d)
               threadDelay 300000
               loop Nothing
@@ -513,20 +530,27 @@ downloadOne seconds downloadsDir src = do
     relevant :: Download -> Bool
     relevant d = d.filename == src.file.filename && d.size == src.file.size
 
-retag :: Track -> FilePath -> IO ()
-retag Track{title=Title title,artist=Artist artist,album=Album album} filePath = do
+retag :: Track -> FilePath -> MaybeT IO FilePath
+retag Track{title=Title title,artist=Artist artist,album=Album album} filePath = MaybeT do
   putStrLn $ "Retagging: " <> filePath
-  threadDelay 10000
   old <- getTrack filePath
-  HTagLib.setTags filePath Nothing
-     $ HTagLib.titleSetter title
-    <> HTagLib.artistSetter artist
-    <> HTagLib.albumSetter album
-  new <- getTrack filePath
-  putStrLn $ "Retagged: " <> filePath
-  putStrLn $ "old: " <> show old
-  putStrLn $ "new: " <> show new
+  retrying 1000 10000 (HTagLib.setTags filePath Nothing
+    $ HTagLib.titleSetter title <> HTagLib.artistSetter artist <> HTagLib.albumSetter album) >>= \case
+    Left (e :: HTagLib.HTagLibException) -> do
+      putStrLn ("Retagging failed: " <> show e)
+      removeFile filePath `catch` \(_::SomeException) -> pure ()
+      pure Nothing
+    Right () -> do
+      new <- getTrack filePath
+      putStrLn $ "Retagged: " <> filePath
+      putStrLn $ "old: " <> show old
+      putStrLn $ "new: " <> show new
+      pure $ Just filePath
 
+retrying :: forall e a. Exception e => Int -> Int -> IO a -> IO (Either e a)
+retrying n delay action
+  | n <= 0    = try action
+  | otherwise = fmap Right action `catch` \(_::e) -> threadDelay delay >> retrying (n-1) delay action
 
 readPlaylist :: String -> String -> String -> IO (String, [Track])
 readPlaylist playlistURL clientId clientSecret = do
@@ -554,31 +578,56 @@ readPlaylist playlistURL clientId clientSecret = do
       pure $ BS.pack tok
 
 waitForHealth :: IO ()
-waitForHealth = do
-  let url = apiRoot <> "/health"
-  let go 0 = fail "slskd: healthcheck timed out"
-      go n = do
-        req <- parseRequest url
-        eres <- (Right <$> httpNoBody req) `catch` (\(_::SomeException) -> pure (Left ()))
-        case eres of
-          Right _ -> pure ()
-          Left _  -> threadDelay 300000 >> go (n-1)
-  go 2000   -- ~10m max
+waitForHealth = retrying 2000 300000 (httpNoBody . parseRequest_ $ apiRoot <> "/health") >>= \case
+  Right _                 -> pure ()
+  Left (_::SomeException) -> fail "slskd: healthcheck timed out"
+
+waitForReady :: IO ()
+waitForReady = do
+  waitForHealth
+  putStrLn "slskd is healthy; waiting for login…"
+  retrying 1200 500000 checkLoggedIn >>= \case
+    Right _                 -> putStrLn "slskd successfully logged in"
+    Left (e::PlaylistException) -> fail $ show e
+
+newtype PlaylistException = PlaylistException Value deriving Show
+instance Exception PlaylistException
+
+-- Throws until the state includes LoggedIn
+checkLoggedIn :: IO ()
+checkLoggedIn = do
+    v <- getResponseBody <$> (httpJSON =<< authed (parseRequest_ (apiV0 <> "/server")))
+    log ("server state:",v)
+    if isLoggedIn v
+      then pure ()
+      else throw (PlaylistException v)
+  where
+    -- Extracts a "state" field from any shape (object/array), then checks for "loggedin".
+    isLoggedIn :: Value -> Bool
+    isLoggedIn = maybe False (\s -> "loggedin" `T.isInfixOf` T.toLower s) . findState
+      where
+        findState :: Value -> Maybe T.Text
+        findState (Object o) =
+          case KM.lookup "state" o of
+            Just (String s) -> Just s
+            _               -> asum $ findState <$> o
+        findState (Array a)  = asum $ findState <$> a
+        findState _          = Nothing
 
 genConfig :: String -> Yaml.Value
 genConfig key = object
   [ "web" .= object
-      [ "authentication" .= object
-          [ "disabled" .= False
-          , "api_keys" .= object
-              [ "cli" .= object
-                  [ "key"  .= key
-                  , "role" .= ("readwrite" :: String)
-                  , "cidr" .= ("127.0.0.1/32,::1/128" :: String)
-                  ]
-              ]
+    [ "authentication" .= object
+      [ "disabled" .= False
+      , "api_keys" .= object
+        [ "cli" .= object
+          [ "key"  .= key
+          , "role" .= ("readwrite" :: String)
+          , "cidr" .= ("127.0.0.1/32,::1/128" :: String)
           ]
+        ]
       ]
+    ]
   ]
 
 withSlskd :: String -> String -> FilePath -> [FilePath] -> IO a -> IO a
@@ -600,7 +649,7 @@ withSlskd username password downloadsDir shared action = do
         -- Nix flake puts slskd on PATH
         (createProcess (proc "slskd" args))
         (\(_,_,_,ph) -> terminateProcess ph >> void (waitForProcess ph))
-        (const $ waitForHealth >> setEnv "SLSKD_API_KEY" secret >> action)
+        (const $ setEnv "SLSKD_API_KEY" secret >> waitForReady >> action)
 
 data Cmd = Cmd { playlist :: String, clientId :: String, clientSecret :: String
                , username :: String, password :: String
@@ -609,52 +658,39 @@ data Cmd = Cmd { playlist :: String, clientId :: String, clientSecret :: String
   deriving (Show, Generic)
 instance ParseRecord Cmd where parseRecord = parseRecordWithModifiers lispCaseModifiers
 
-getTrack :: FilePath -> IO Track
-getTrack path = HTagLib.getTags path
+getTrack :: FilePath -> IO (Maybe Track)
+getTrack path = fmap eitherToMaybe . try @HTagLib.HTagLibException . HTagLib.getTags path
               $ Track
             <$> fmap Title    HTagLib.titleGetter
             <*> fmap Artist   HTagLib.artistGetter
             <*> fmap Album    HTagLib.albumGetter
             <*> fmap Duration HTagLib.durationGetter
 
-getMissing :: FilePath -> [Track] -> IO ([Track], [Track])
-getMissing downloadsDir playlist = do
-  existingTracks <- mapM getTrack . mapMaybe (\case {DirTree.File _ file -> Just file; _ -> Nothing})
-                  . DirTree.flattenDir . (.dirTree) =<< DirTree.build downloadsDir
-  putStrLn $ "local tracks: " <> show (length existingTracks)
+getExistingTracks :: FilePath -> IO (HM.HashMap TrackKey (Track, FilePath))
+getExistingTracks dir = foldl' step HM.empty . DirTree.flattenDir . DirTree.zipPaths
+                                           <$> DirTree.readDirectoryWith getTrack dir
+  where
+    step acc (DirTree.File _ (path, Just t)) = HM.insert (trackKey t) (t,  path) acc
+    step acc _                               = acc
 
-  let (have,missing) = partition (`elem` existingTracks) playlist
-  putStrLn $ " have tracks: " <> show (length have)
-  putStrLn $ " miss tracks: " <> show (length missing)
+partitionPlaylist :: [Track] -> HM.HashMap TrackKey (Track, FilePath) -> ([Track], [FilePath])
+partitionPlaylist playlist existing =
+  partitionEithers
+  $ playlist <&> \track ->
+  case HM.lookup (trackKey track) existing of
+    Just (track',path) | within5 track.duration track'.duration -> Right path
+    _                                                           -> Left track
+  where
+    within5 :: Duration -> Duration -> Bool
+    within5 = on (\x y -> abs (x-y) <= 5) getDuration
 
-  pure (have, missing)
-
-expandTilde :: FilePath -> IO FilePath
-expandTilde ('~':path) = getHomeDirectory <&> (</> path)
-expandTilde path       = pure path
-
-createM3uPlaylist :: FilePath -> String -> [Track] -> IO ()
-createM3uPlaylist downloadsDir playlistId tracks = do
-  files <- mapMaybe (\case {DirTree.File _ file -> Just file; _ -> Nothing})
-         . DirTree.flattenDir . (.dirTree) <$> DirTree.build downloadsDir
-  trackFiles <- filterM (\f -> (`elem` tracks) <$> getTrack f) files
-
+createM3uPlaylist :: FilePath -> String -> [FilePath] -> IO ()
+createM3uPlaylist downloadsDir playlistId trackFiles = do
   let m3uPath = downloadsDir </> playlistId <> ".m3u"
-      m3uContent = "#EXTM3U\n" <> concatMap formatTrack trackFiles
+      m3uContent = "#EXTM3U\n" <> unlines trackFiles
 
   writeFile m3uPath m3uContent
   putStrLn $ "Created playlist: " <> m3uPath <> " with " <> show (length trackFiles) <> " tracks"
-  where
-    formatTrack :: FilePath -> String
-    formatTrack filePath =
-      let relPath = makeRelativePath downloadsDir filePath
-      in relPath <> "\n"
-
-    makeRelativePath :: FilePath -> FilePath -> FilePath
-    makeRelativePath base path =
-      if base `isPrefixOf` path
-        then drop (length base + 1) path
-        else takeFileName path
 
 main :: IO ()
 main = do
@@ -663,23 +699,22 @@ main = do
   setEnv "DEBUG" $ show debug
 
   (playlistId, playlistTracks) <- readPlaylist playlist clientId clientSecret
-  putStrLn $ " list tracks: " <> show (length playlistTracks)
+  putStrLn $ "list tracks: " <> show (length playlistTracks)
 
   downloadsDir <- downloads & \case
     ('~':path) -> getHomeDirectory <&> (</> path)
     _          -> pure downloads
-  (_, missing) <- getMissing downloadsDir playlistTracks
 
-  let missingChunks = chunksOf 10 missing
+  (miss, have) <- partitionPlaylist playlistTracks <$> getExistingTracks downloadsDir
+  putStrLn $ "have tracks: " <> show (length have)
+  putStrLn $ "miss tracks: " <> show (length miss)
 
-  withSlskd username password downloads shared $
-    forM_ missingChunks $ mapConcurrently_ \track ->
-      search track >>= download downloadsDir . prioritize track
-      >>= maybe (putStrLn $ "Couldn't download " <> show track) (retag track)
+  (remaining, done) <- withSlskd username password downloads shared $
+    fmap partitionEithers $ flip (mapConcurrentlyBounded 5) miss \track -> maybeToEither track
+      <$> runMaybeT (search track >>= download downloadsDir . prioritize track >>= retag track)
 
-  (finalHave, finalMissing) <- getMissing downloadsDir playlistTracks
-  createM3uPlaylist downloadsDir playlistId finalHave
+  createM3uPlaylist downloadsDir playlistId $ have <> done
 
   putStrLn "FINISHED! Still missing:"
-  mapM_ (putStrLn . show) finalMissing
-  
+  mapM_ (putStrLn . show) remaining
+
